@@ -1,0 +1,23 @@
+# Video/audio downloading
+yt-dlp>=2025.10.14
+
+# Audio analysis and manipulation
+pydub>=0.25.1
+librosa>=0.10.2
+soundfile>=0.12.1
+soxr>=0.3.2
+audioread>=3.0.1
+numba>=0.60.0
+scipy>=1.12.0
+numpy>=2.3.0
+
+# Voice activity detection
+webrtcvad>=2.0.10
+silero-vad-cpu>=5.0.2  # CPU-only version (safe for WSL)
+
+# API and network requests
+requests>=2.32.0
+
+# Miscellaneous
+python-dotenv
+

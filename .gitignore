@@ -1,0 +1,14 @@
+/__pycache__
+/logs
+/venv
+
+.env
+*.m4a
+*.mp4
+submitted.txt
+
+# Script is still in development so for now, no urls.txt
+urls.txt
+
+# My personal notes regarding the script
+notes.md
