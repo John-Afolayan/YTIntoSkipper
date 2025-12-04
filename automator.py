@@ -1,208 +1,141 @@
-# automator.py
-from pathlib import Path
-import numpy as np
 import os
-import shutil
-from typing import Optional, Tuple
-
-from models import IntroSegment
+from typing import Tuple, Optional, Iterable, Iterator # Updated imports
+# REMOVED: from automator import IntroSkipperAutomator <-- This line caused the crash
+from sponsorblock_api import SponsorBlockAPI
+from youtube_downloader import YouTubeDownloader
 from audio_fingerprint import AudioFingerprinter
 from speech_detector import SpeechDetector
-from youtube_downloader import YouTubeDownloader
-from sponsorblock_api import SponsorBlockAPI
+from models import IntroSegment
 from logger import logger
 
 class IntroSkipperAutomator:
     """Main automation class"""
 
-    def __init__(self, reference_intro_path: str = None, manual_approval: bool = False):
+    def __init__(self, manual_approval: bool = False):
         self.fingerprinter = AudioFingerprinter()
         self.speech_detector = SpeechDetector()
         self.downloader = YouTubeDownloader()
         self.sponsorblock = SponsorBlockAPI()
         self.manual_approval = manual_approval
 
-        self.reference_fingerprint = None
-        self.intro_duration = 10.4
+        self.reference_data = None
+        self.intro_duration = 0.0
 
-        if reference_intro_path:
-            self.set_reference_intro(reference_intro_path)
+    def set_reference_intro(self, audio_path: str, duration: float = None):
+        logger.info(f"Analyzing reference intro: {audio_path}")
+        self.reference_data = self.fingerprinter.generate_fingerprint(audio_path, duration=duration)
+        
+        if self.reference_data:
+            self.intro_duration = self.reference_data["duration"]
+            logger.info(f"Reference intro set. Duration: {self.intro_duration:.2f}s")
+        else:
+            raise ValueError("Failed to analyze reference intro audio")
 
-    def set_reference_intro(self, audio_path: str, duration: float = 10.4):
-        logger.info(f"Setting reference intro from: {audio_path}")
-        self.reference_fingerprint = self.fingerprinter.generate_fingerprint(audio_path, duration=duration)
-        self.intro_duration = duration
-
-        if not self.reference_fingerprint:
-            raise ValueError("Failed to generate reference fingerprint")
-
-    def find_intro_in_video(self, audio_path: str, search_window: float = 60.0) -> Optional[IntroSegment]:
-        if not self.reference_fingerprint:
+    def find_intro_in_video(self, audio_path: str) -> Optional[IntroSegment]:
+        if not self.reference_data:
             raise ValueError("No reference intro set")
 
-        logger.info("Searching for intro in video...")
-        best_match = None
-        best_score = 0.0
+        # Search first 240 seconds (4 minutes)
+        match_result = self.fingerprinter.find_match(self.reference_data, audio_path, search_limit_seconds=240.0)
 
-        window_step = 1.0
-        search_positions = list(np.arange(0, search_window, window_step))
-        if 0.0 not in search_positions:
-            search_positions.insert(0, 0.0)
+        if match_result:
+            start_time, end_time, score = match_result
+            logger.info(f"Match candidate found: {start_time:.2f}s - {end_time:.2f}s (Score: {score:.3f})")
 
-        for i, start_time in enumerate(search_positions):
-            if i % 10 == 0:
-                logger.info(f"Searching... {i}/{len(search_positions)} positions checked (best score so far: {best_score:.2f})")
-
-            fingerprint = self.fingerprinter.generate_fingerprint(
-                audio_path,
-                start_time=start_time,
-                duration=self.intro_duration + 2
-            )
-
-            if fingerprint:
-                score = self.fingerprinter.compare_fingerprints(self.reference_fingerprint, fingerprint)
-
-                if score > best_score:
-                    best_score = score
-                    best_match = start_time
-                    logger.info(f"New best match at {start_time:.1f}s with score: {score:.3f}")
-
-                if score > 0.90:
-                    logger.info(f"High confidence match found at {start_time:.1f}s (score: {score:.2f})")
-                    break
-
-        if best_match is None:
-            logger.warning("No match positions produced any fingerprinting results")
-            return None
-
-        logger.info(f"Search complete. Best match at {best_match:.1f}s with score {best_score:.3f}")
-
-        if best_score > 0.5:
-            end_time = best_match + self.intro_duration
-            logger.info(f"Using intro duration: {best_match:.1f}s to {end_time:.1f}s (duration: {end_time - best_match:.1f}s)")
-
-            return IntroSegment(
-                start_time=best_match,
-                end_time=end_time,
-                confidence=best_score
-            )
-
-        logger.warning(f"No intro found (best score: {best_score:.2f} is below threshold of 0.5)")
+            if score > 0.45:
+                return IntroSegment(start_time=start_time, end_time=end_time, confidence=score)
+        
+        logger.warning("No intro match found above threshold.")
         return None
 
     def process_video(self, url: str, skip_if_exists: bool = True) -> Tuple[bool, str, str]:
+        audio_path = None
+        video_id = "unknown"
+
         try:
-            video_id = self.downloader.extract_video_id(url)
-            logger.info(f"Processing video ID: {video_id}")
+            # Extract ID first to check SponsorBlock before downloading
+            try:
+                video_id = self.downloader.extract_video_id(url)
+            except Exception:
+                # If extraction fails, we might be dealing with a raw ID or complex URL
+                # Let the downloader handle it later, but we can't skip_if_exists easily
+                pass
 
-            if skip_if_exists:
-                logger.info(f"Checking SponsorBlock for existing intro segments...")
+            logger.info(f"Processing: {url} (ID: {video_id})")
+
+            if video_id != "unknown" and skip_if_exists:
                 existing_segments = self.sponsorblock.get_segments(video_id)
-
-                has_intro = False
-                if existing_segments:
-                    for seg in existing_segments:
-                        category = seg.get('category', '')
-                        if category == 'intro':
-                            segment_time = seg.get('segment', [0, 0])
-                            logger.info(f"Found existing intro segment: {segment_time[0]:.1f}s - {segment_time[1]:.1f}s")
-                            has_intro = True
-                            break
-
-                if has_intro:
-                    logger.info(f"Video {video_id} already has intro segment(s), skipping entirely...")
+                if any(s.get('category') == 'intro' for s in existing_segments):
+                    logger.info(f"Video {video_id} already has intro segment(s), skipping...")
                     return True, 'skipped', video_id
-                else:
-                    logger.info(f"No intro segments found for {video_id}, proceeding with processing...")
 
-            audio_path, video_id = self.downloader.download_audio(url)
+            try:
+                audio_path, video_id = self.downloader.download_audio(url)
+            except Exception as e:
+                logger.error(f"Download failed: {e}")
+                return False, 'failed', video_id
 
             intro_segment = self.find_intro_in_video(audio_path)
 
             if intro_segment:
                 intro_segment.video_id = video_id
-                logger.info(f"Found intro: {intro_segment.start_time:.1f}s - {intro_segment.end_time:.1f}s (confidence: {intro_segment.confidence:.2f})")
-
+                
                 if self.manual_approval:
-                    print(f"\n{'='*60}")
-                    print(f"Video: {url}")
-                    print(f"Video ID: {video_id}")
-                    print(f"Detected intro segment:")
-                    print(f"  Start: {intro_segment.start_time:.2f}s")
-                    print(f"  End: {intro_segment.end_time:.2f}s")
-                    print(f"  Duration: {intro_segment.end_time - intro_segment.start_time:.2f}s")
-                    print(f"  Confidence: {intro_segment.confidence:.2f}")
-                    print(f"{'='*60}")
-
-                    if intro_segment.confidence < 0.8:
-                        logger.warning(f"Low confidence for intro for {url}, aborting")
+                    self._print_manual_prompt(url, video_id, intro_segment)
+                    if not self._get_user_confirmation():
                         return False, 'skipped', video_id
 
-                    while True:
-                        response = input("Submit this segment to SponsorBlock? (y/n or yes/no): ").strip().lower()
-                        if response in ['y', 'yes']:
-                            print("Submitting segment...")
-                            break
-                        elif response in ['n', 'no']:
-                            print("Segment submission cancelled.")
-                            return False, 'skipped', video_id
-                        else:
-                            print("Invalid response. Please enter 'y', 'n', 'yes', or 'no'.")
-
                 success = self.sponsorblock.submit_segment(
-                    video_id,
-                    intro_segment.start_time,
-                    intro_segment.end_time
+                    video_id, intro_segment.start_time, intro_segment.end_time
                 )
-
                 return success, 'success' if success else 'failed', video_id
+            
             else:
-                logger.warning(f"No intro found in video {video_id}")
                 return False, 'failed', video_id
 
         except Exception as e:
             logger.error(f"Failed to process video {url}: {e}")
-            return False, 'failed'
+            return False, 'failed', video_id
+            
+        finally:
+            if audio_path and os.path.exists(audio_path):
+                try:
+                    os.remove(audio_path)
+                except OSError:
+                    pass
 
-    def process_url_list(self, urls_file: str):
-        with open(urls_file, 'r') as f:
-            urls = [line.strip() for line in f if line.strip() and not line.startswith('#')]
+    def _print_manual_prompt(self, url, video_id, segment):
+        print(f"\n{'='*60}")
+        print(f"Video: {url}")
+        print(f"Detected intro: {segment.start_time:.2f}s - {segment.end_time:.2f}s")
+        print(f"Confidence: {segment.confidence:.2f}")
+        print(f"{'='*60}")
 
-        logger.info(f"Processing {len(urls)} videos...")
+    def _get_user_confirmation(self):
+        while True:
+            r = input("Submit? (y/n): ").strip().lower()
+            if r in ['y', 'yes']: return True
+            if r in ['n', 'no']: return False
 
+    def process_from_source(self, url_source: Iterable[str]):
+        """
+        Accepts any iterable (list, generator, etc) of URLs.
+        """
         results = {'success': 0, 'failed': 0, 'skipped': 0}
+        
+        try:
+            for i, url in enumerate(url_source, 1):
+                url = url.strip()
+                if not url or url.startswith('#'): continue
 
-        failed_file = Path("failed.txt")
-        # Load existing failed IDs to avoid duplicates
-        existing_failed = set()
-        if failed_file.exists():
-            try:
-                with failed_file.open("r", encoding="utf-8") as fh:
-                    existing_failed = {line.strip() for line in fh if line.strip()}
-            except Exception as e:
-                logger.warning("Could not read existing failed file %s: %s", failed_file, e)
-                existing_failed = set()
-
-        new_failed = []  # collect new failed ids (or URLs) to append later
-
-        for i, url in enumerate(urls, 1):
-            logger.info(f"\n[{i}/{len(urls)}] Processing: {url}")
-            success, status, video_id = self.process_video(url)
-            results[status] += 1
-            if not success and url not in existing_failed:
-                new_failed.append(url)
-                existing_failed.add(url)  # keep in-memory set up-to-date
-
-        logger.info(f"\n=== Processing Complete ===")
-        logger.info(f"Success: {results['success']}")
-        logger.info(f"Skipped: {results['skipped']}")
-        logger.info(f"Failed: {results['failed']}")
-        logger.info(f"Total: {len(urls)}")
+                logger.info(f"\n--- Item {i} ---")
+                success, status, vid = self.process_video(url)
+                results[status] += 1
+        except KeyboardInterrupt:
+            logger.warning("\nProcess interrupted by user.")
+        
+        logger.info(f"\n=== Session Complete ===")
+        logger.info(f"Success: {results['success']}, Failed: {results['failed']}, Skipped: {results['skipped']}")
 
     def cleanup(self):
         self.fingerprinter.cleanup()
-        if hasattr(self.downloader, 'output_dir'):
-            if self.downloader.output_dir.startswith('/tmp/'):
-                shutil.rmtree(self.downloader.output_dir, ignore_errors=True)
-                logger.info("Cleaned up temporary files")
-                
