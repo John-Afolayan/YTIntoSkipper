@@ -51,6 +51,7 @@ class YouTubeDownloader:
             "-f", "bestaudio[ext=m4a]/bestaudio", # Prefer m4a, take whatever is best audio otherwise
             "-x", "--audio-format", "m4a",        # Force convert to m4a for consistency
             "--audio-quality", "0",
+            "--cookies", "/mnt/c/Users/John/Downloads/brave_cookies.txt",
             "-o", output_template,
             url
         ]

@@ -13,7 +13,7 @@ numpy>=2.3.0
 
 # Voice activity detection
 webrtcvad>=2.0.10
-silero-vad-cpu>=5.0.2  # CPU-only version (safe for WSL)
+silero-vad>=5.0.2  # CPU-only version (safe for WSL)
 
 # API and network requests
 requests>=2.32.0

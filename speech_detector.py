@@ -70,4 +70,4 @@ class SpeechDetector:
 
         except Exception as e:
             logger.error(f"VAD error: {e}")
-            return None
+            return None 
