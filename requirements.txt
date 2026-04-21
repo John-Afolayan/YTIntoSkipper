@@ -18,6 +18,9 @@ silero-vad>=5.0.2  # CPU-only version (safe for WSL)
 # API and network requests
 requests>=2.32.0
 
+# Progress bars
+tqdm>=4.66.0
+
 # Miscellaneous
 python-dotenv
 
