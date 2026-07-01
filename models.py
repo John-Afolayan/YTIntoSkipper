@@ -9,6 +9,7 @@ class IntroSegment:
     end_time: float
     confidence: float
     video_id: str = ""
+    video_duration: float = 0.0
 
     @property
     def duration(self) -> float:

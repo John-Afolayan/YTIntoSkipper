@@ -11,9 +11,23 @@ class YouTubeDownloader:
         self._check_dependencies()
 
     def _check_dependencies(self):
+        # Prefer venv/bin/yt-dlp if it exists (local to this project)
+        local_yt_dlp = Path(__file__).resolve().parent / "venv" / "bin" / "yt-dlp"
+        self.yt_dlp_cmd = "yt-dlp"
+        if local_yt_dlp.exists():
+            self.yt_dlp_cmd = str(local_yt_dlp)
+
         try:
-            subprocess.run(["yt-dlp", "--version"], capture_output=True, check=True)
+            subprocess.run([self.yt_dlp_cmd, "--version"], capture_output=True, check=True)
         except (subprocess.CalledProcessError, FileNotFoundError):
+            if self.yt_dlp_cmd != "yt-dlp":
+                 # Try global as fallback
+                 try:
+                     subprocess.run(["yt-dlp", "--version"], capture_output=True, check=True)
+                     self.yt_dlp_cmd = "yt-dlp"
+                     return
+                 except (subprocess.CalledProcessError, FileNotFoundError):
+                     pass
             raise RuntimeError("yt-dlp not found. Please install yt-dlp.")
 
     def extract_video_id(self, url: str) -> str:
@@ -47,7 +61,7 @@ class YouTubeDownloader:
 
         # Simplified attempt logic for brevity - prioritizing m4a
         cmd = [
-            "yt-dlp",
+            self.yt_dlp_cmd,
             "-f", "bestaudio[ext=m4a]/bestaudio", # Prefer m4a, take whatever is best audio otherwise
             "-x", "--audio-format", "m4a",        # Force convert to m4a for consistency
             "--audio-quality", "0",

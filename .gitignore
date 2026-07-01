@@ -5,6 +5,9 @@
 .env
 *.m4a
 *.mp4
+*.zip
+*.db
+*.db-*
 submitted.txt
 
 # Script is still in development so for now, no urls.txt

@@ -23,6 +23,29 @@ from logger import logger
 from populate_urls import yt_dlp_stream_list, build_watch_url_from_entry
 
 
+def _extract_channel_id_from_url(url: str) -> str:
+    """Extract a channel identifier from a YouTube channel URL."""
+    import re
+    # Match @handle format: youtube.com/@handle
+    match = re.search(r'youtube\.com/@([^/?&]+)', url)
+    if match:
+        return match.group(1)
+    # Match /channel/UC... format
+    match = re.search(r'youtube\.com/channel/([^/?&]+)', url)
+    if match:
+        return match.group(1)
+    # Match /c/name format
+    match = re.search(r'youtube\.com/c/([^/?&]+)', url)
+    if match:
+        return match.group(1)
+    # Fallback: use the last path segment
+    from urllib.parse import urlparse
+    path = urlparse(url).path.rstrip("/")
+    if path:
+        return path.split("/")[-1]
+    return url
+
+
 def url_generator_from_file(filepath):
     """Yields URLs from a text file."""
     with open(filepath, "r") as f:
@@ -87,6 +110,15 @@ def main():
     parser.add_argument("--delete-video", help="Delete intro segments for a specific video ID")
     parser.add_argument("--list-segments", help="List all segments for a video ID")
 
+    # --- Channel & Learning ---
+    parser.add_argument("--channel-id", help="Channel identifier for per-channel adaptive learning")
+    parser.add_argument("--recalibrate", action="store_true",
+                        help="Force recalculation of channel profile from feedback and exit")
+    parser.add_argument("--show-profile", action="store_true",
+                        help="Display learned channel profile and exit")
+    parser.add_argument("--feedback-stats", action="store_true",
+                        help="Show feedback statistics for the channel and exit")
+
     # --- Database ---
     parser.add_argument("--db", default="intro_skipper.db", help="SQLite database path")
     parser.add_argument("--db-stats", action="store_true", help="Print database statistics and exit")
@@ -126,6 +158,84 @@ def main():
         db.close()
         return
 
+    # --- Feedback / Learning commands ---
+    if args.show_profile:
+        from feedback_store import FeedbackStore
+        from adaptive_engine import AdaptiveEngine
+        store = FeedbackStore(args.db)
+        if args.channel_id:
+            engine = AdaptiveEngine(store)
+            profile = engine.get_profile(args.channel_id)
+            if profile:
+                print(f"Channel profile: {args.channel_id}")
+                print(f"  Avg intro duration: {profile['avg_intro_duration']:.2f}s (±{profile['duration_stddev']:.2f})")
+                print(f"  Avg start offset:   {profile['avg_start_offset']:.2f}s (±{profile['start_stddev']:.2f})")
+                print(f"  Avg end error:      {profile['avg_end_error']:+.2f}s")
+                print(f"  Avg start error:    {profile['avg_start_error']:+.2f}s")
+                print(f"  False positive rate: {profile['false_positive_rate']:.1%}")
+                print(f"  Confidence bias:    {profile['confidence_bias']:+.3f}")
+                print(f"  Sample count:       {profile['sample_count']}")
+                print(f"  Last recalculated:  {profile['last_recalculated']}")
+            else:
+                print(f"No profile for channel '{args.channel_id}'. Need at least 5 feedback entries.")
+        else:
+            profiles = store.get_all_profiles()
+            if profiles:
+                for p in profiles:
+                    print(f"  {p['channel_id']}: dur={p['avg_intro_duration']:.2f}s, "
+                          f"samples={p['sample_count']}, FP={p['false_positive_rate']:.1%}")
+            else:
+                print("No channel profiles yet.")
+        store.close()
+        return
+
+    if args.recalibrate:
+        if not args.channel_id:
+            parser.error("--recalibrate requires --channel-id")
+        from feedback_store import FeedbackStore
+        from adaptive_engine import AdaptiveEngine
+        store = FeedbackStore(args.db)
+        engine = AdaptiveEngine(store)
+        profile = engine.recalculate_profile(args.channel_id)
+        if profile:
+            print(f"Profile recalculated for {args.channel_id} ({profile['sample_count']} samples)")
+        else:
+            print("Insufficient feedback data to build a profile.")
+        store.close()
+        return
+
+    if args.feedback_stats:
+        from feedback_store import FeedbackStore
+        store = FeedbackStore(args.db)
+        channel = args.channel_id or "(all channels)"
+        if args.channel_id:
+            counts = store.count_feedback(args.channel_id)
+            patterns = store.get_denial_patterns(args.channel_id)
+        else:
+            # Show all feedback
+            counts = {}
+            try:
+                rows = store._get_conn().execute(
+                    "SELECT action, COUNT(*) as cnt FROM feedback GROUP BY action"
+                ).fetchall()
+                counts = {r["action"]: r["cnt"] for r in rows}
+            except Exception:
+                pass
+            patterns = {}
+        if counts:
+            print(f"Feedback stats for {channel}:")
+            for action, count in sorted(counts.items()):
+                print(f"  {action}: {count}")
+            print(f"  TOTAL: {sum(counts.values())}")
+            if patterns:
+                print(f"Denial reasons:")
+                for reason, count in sorted(patterns.items(), key=lambda x: -x[1]):
+                    print(f"  {reason}: {count}")
+        else:
+            print("No feedback recorded yet.")
+        store.close()
+        return
+
     # --- List / Delete commands ---
     if args.list_segments:
         user_id = args.user_id or os.getenv("SPONSORBLOCK_USER_ID")
@@ -151,6 +261,11 @@ def main():
     if not args.urls_file and not args.channel:
         parser.error("You must provide either --urls-file OR --channel")
 
+    # Resolve channel_id: explicit flag, or extract from --channel URL
+    channel_id = args.channel_id
+    if not channel_id and args.channel:
+        channel_id = _extract_channel_id_from_url(args.channel)
+
     automator = IntroSkipperAutomator(
         manual_approval=args.manual_approval,
         dry_run=args.dry_run,
@@ -162,6 +277,7 @@ def main():
         early_exit_threshold=args.early_exit,
         workers=args.workers,
         db_path=args.db,
+        channel_id=channel_id,
     )
 
     # Load reference intro(s)

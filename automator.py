@@ -10,6 +10,8 @@ from sponsorblock_api import SponsorBlockAPI
 from youtube_downloader import YouTubeDownloader
 from audio_fingerprint import AudioFingerprinter
 from video_db import VideoDB
+from feedback_store import FeedbackStore, REASON_CATEGORIES, REASON_LABELS
+from adaptive_engine import AdaptiveEngine
 from models import IntroSegment
 from logger import logger
 
@@ -143,6 +145,8 @@ class IntroSkipperAutomator:
         workers: int = 1,
         # DB path
         db_path: str = "intro_skipper.db",
+        # Channel tracking
+        channel_id: str = None,
     ):
         self.fingerprinter = AudioFingerprinter()
         self.downloader = YouTubeDownloader()
@@ -152,6 +156,11 @@ class IntroSkipperAutomator:
         self.dry_run = dry_run
         self.clipboard = clipboard
         self.trim_speech = trim_speech
+        self.channel_id = channel_id
+
+        # Feedback & adaptive learning
+        self.feedback_store = FeedbackStore(db_path)
+        self.adaptive_engine = AdaptiveEngine(self.feedback_store)
 
         # Tunable
         self.peak_height = peak_height
@@ -163,6 +172,10 @@ class IntroSkipperAutomator:
         # Multi-reference support: list of (fingerprint_data, duration)
         self._references: List[dict] = []
         self.intro_duration = 0.0
+
+        # Load channel profile on startup if available
+        if self.channel_id:
+            self.adaptive_engine.maybe_recalculate(self.channel_id)
 
     # ------------------------------------------------------------------
     # Reference management (supports multiple reference files)
@@ -416,8 +429,19 @@ class IntroSkipperAutomator:
         if start_time > 0.5:
             start_time = max(0.0, start_time - 0.2)
 
+        # Get full video duration from audio file
+        video_duration = 0.0
+        try:
+            import librosa
+            video_duration = librosa.get_duration(path=audio_path)
+        except Exception:
+            pass
+
         return IntroSegment(
-            start_time=start_time, end_time=end_time, confidence=raw_confidence,
+            start_time=start_time,
+            end_time=end_time,
+            confidence=raw_confidence,
+            video_duration=video_duration
         )
 
     # ------------------------------------------------------------------
@@ -489,6 +513,49 @@ class IntroSkipperAutomator:
                 intro_segment.video_id = video_id
                 confidence_tier = self._classify_confidence(intro_segment.confidence)
 
+                # --- Adaptive corrections ---
+                correction = None
+                if self.channel_id:
+                    correction = self.adaptive_engine.apply_corrections(
+                        intro_segment, self.channel_id,
+                    )
+                    if correction.should_reject:
+                        logger.info(
+                            f"Adaptive rejection ({correction.reject_reason}): {url}"
+                        )
+                        print(f"\n  [ADAPTIVE SKIP] {correction.reject_reason}: {url}")
+                        self.db.record(video_id, "adaptive_rejected")
+                        return False, "failed", video_id
+
+                    if correction.flags:
+                        for flag in correction.flags:
+                            if flag != "insufficient_data":
+                                logger.info(f"Adaptive correction: {flag}")
+
+                    # Apply corrections
+                    if correction.corrected_start != intro_segment.start_time:
+                        logger.info(
+                            f"Start adjusted: {intro_segment.start_time:.2f}s -> "
+                            f"{correction.corrected_start:.2f}s"
+                        )
+                        intro_segment.start_time = correction.corrected_start
+                    if correction.corrected_end != intro_segment.end_time:
+                        logger.info(
+                            f"End adjusted: {intro_segment.end_time:.2f}s -> "
+                            f"{correction.corrected_end:.2f}s"
+                        )
+                        intro_segment.end_time = correction.corrected_end
+
+                    # Adjust effective confidence for threshold decisions
+                    effective_confidence = intro_segment.confidence + correction.confidence_adjustment
+                    confidence_tier = self._classify_confidence(effective_confidence)
+
+                    # Flag deviations for manual review
+                    has_deviation = any("deviation" in f for f in correction.flags)
+                    if has_deviation and confidence_tier == "high":
+                        confidence_tier = "medium"
+                        logger.info("Deviation detected — downgrading to medium confidence for review")
+
                 if self.dry_run:
                     self._print_manual_prompt(url, video_id, intro_segment, dry_run=True)
                     self.db.record(video_id, "dry_run", intro_segment.start_time, intro_segment.end_time)
@@ -513,15 +580,31 @@ class IntroSkipperAutomator:
                             print(f"  (Copied to clipboard: {clipboard_url})")
                         else:
                             print(f"  (Clipboard copy failed. URL: {clipboard_url})")
-                    if not self._get_user_confirmation():
-                        self.db.record(video_id, "rejected")
+                    if not self._get_user_approval_with_feedback(url, video_id, intro_segment):
                         return False, "skipped", video_id
+                else:
+                    # Auto-approved (high confidence) — record positive feedback
+                    if self.channel_id:
+                        self.feedback_store.record_feedback(
+                            video_id=video_id,
+                            action="approved",
+                            channel_id=self.channel_id,
+                            detected_start=intro_segment.start_time,
+                            detected_end=intro_segment.end_time,
+                            raw_confidence=intro_segment.confidence,
+                        )
 
                 success = self.sponsorblock.submit_segment(
-                    video_id, intro_segment.start_time, intro_segment.end_time,
+                    video_id,
+                    intro_segment.start_time,
+                    intro_segment.end_time,
+                    video_duration=intro_segment.video_duration
                 )
                 if success:
                     self.db.record(video_id, "success", intro_segment.start_time, intro_segment.end_time)
+                    # Periodic recalibration
+                    if self.channel_id:
+                        self.adaptive_engine.maybe_recalculate(self.channel_id)
                     return True, "success", video_id
                 else:
                     # API failure is transient — don't record permanently
@@ -572,6 +655,103 @@ class IntroSkipperAutomator:
                 return True
             if r in ["n", "no"]:
                 return False
+
+    def _get_user_approval_with_feedback(
+        self, url: str, video_id: str, segment: IntroSegment,
+    ) -> bool:
+        """
+        Streamlined approval prompt with quick correction support.
+        """
+        while True:
+            r = input("  [y] Approve  [n] Deny  [c] Correct & Submit  [q] Skip video: ").strip().lower()
+            if r == "y":
+                # Approved as-is
+                if self.channel_id:
+                    self.feedback_store.record_feedback(
+                        video_id=video_id,
+                        action="approved",
+                        channel_id=self.channel_id,
+                        detected_start=segment.start_time,
+                        detected_end=segment.end_time,
+                        raw_confidence=segment.confidence,
+                        weighted_score=getattr(segment, "weighted_score", None),
+                    )
+                return True
+            
+            if r == "q":
+                return False
+
+            if r == "c":
+                # Partial approval / Correction
+                print(f"\n  Current: {segment.start_time:.2f}s - {segment.end_time:.2f}s")
+                
+                def _parse_time(prompt, default):
+                    val = input(prompt).strip().lower()
+                    if not val:
+                        return default
+                    # Remove 's', 'sec', etc.
+                    clean_val = "".join(c for c in val if c.isdigit() or c in ".-")
+                    try:
+                        return float(clean_val)
+                    except ValueError:
+                        print(f"    Invalid input '{val}', using default.")
+                        return default
+
+                new_start = _parse_time(f"  Correct start (Enter for {segment.start_time:.2f}s): ", segment.start_time)
+                new_end = _parse_time(f"  Correct end   (Enter for {segment.end_time:.2f}s): ", segment.end_time)
+                
+                # Update the segment object so the caller submits the new times
+                segment.start_time = new_start
+                segment.end_time = new_end
+                
+                if self.channel_id:
+                    self.feedback_store.record_feedback(
+                        video_id=video_id,
+                        action="approved", # It's still an approval, just corrected
+                        channel_id=self.channel_id,
+                        detected_start=segment.start_time,
+                        detected_end=segment.end_time,
+                        correct_start=new_start,
+                        correct_end=new_end,
+                        raw_confidence=segment.confidence,
+                    )
+                return True
+
+            if r == "n":
+                # Denied
+                break
+
+        # --- Collect denial reason ---
+        self.db.record(video_id, "rejected")
+        if not self.channel_id:
+            return False
+
+        print("\n  Reason? [1] Wrong start [2] Wrong end [3] No intro [4] Too short [5] Too long [6] Other")
+        reason_input = input("  Selection (e.g. 3): ").strip()
+        
+        reason_cats = []
+        for part in reason_input.split(","):
+            part = part.strip()
+            if part in REASON_CATEGORIES:
+                reason_cats.append(REASON_CATEGORIES[part])
+        reason_categories = ",".join(reason_cats) if reason_cats else None
+
+        self.feedback_store.record_feedback(
+            video_id=video_id,
+            action="denied",
+            channel_id=self.channel_id,
+            detected_start=segment.start_time,
+            detected_end=segment.end_time,
+            reason_categories=reason_categories,
+            raw_confidence=segment.confidence,
+            weighted_score=getattr(segment, "weighted_score", None),
+        )
+        print("  Feedback saved.")
+
+        # Check if we should recalculate
+        self.adaptive_engine.maybe_recalculate(self.channel_id)
+        
+        return False
 
     # ------------------------------------------------------------------
     # Batch processing (sequential or parallel)
@@ -797,3 +977,4 @@ class IntroSkipperAutomator:
     def cleanup(self):
         self.fingerprinter.cleanup()
         self.db.close()
+        self.feedback_store.close()
