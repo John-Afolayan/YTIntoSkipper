@@ -1,34 +1,91 @@
 import os
+import shutil
 import subprocess
+import sys
 from pathlib import Path
 from logger import logger
+
+
+def resolve_yt_dlp_command():
+    root = Path(__file__).resolve().parent
+    candidates = []
+
+    if os.name == "nt":
+        candidates.append([str(root / "venv" / "Scripts" / "yt-dlp.exe")])
+    else:
+        candidates.append([str(root / "venv" / "bin" / "yt-dlp")])
+
+    candidates.append([sys.executable, "-m", "yt_dlp"])
+
+    base_executable = getattr(sys, "_base_executable", None)
+    if base_executable and base_executable != sys.executable:
+        candidates.append([base_executable, "-m", "yt_dlp"])
+
+    candidates.append(["python", "-m", "yt_dlp"])
+
+    path_cmd = shutil.which("yt-dlp")
+    if path_cmd:
+        candidates.append([path_cmd])
+    candidates.append(["yt-dlp"])
+
+    for cmd in candidates:
+        executable = Path(cmd[0]) if os.path.sep in cmd[0] else None
+        if executable and not executable.exists():
+            continue
+        try:
+            subprocess.run([*cmd, "--version"], capture_output=True, check=True)
+            return cmd
+        except (subprocess.CalledProcessError, FileNotFoundError, OSError) as e:
+            logger.debug(f"yt-dlp candidate failed ({' '.join(cmd)}): {e}")
+
+    raise RuntimeError("yt-dlp not found. Please install yt-dlp.")
+
 
 class YouTubeDownloader:
     """Handles audio downloading from YouTube with robust fallbacks."""
 
     def __init__(self, cookies_file=None):
-        self.cookies_file = cookies_file
+        self.cookies_file = self._resolve_cookies_file(cookies_file)
         self._check_dependencies()
 
-    def _check_dependencies(self):
-        # Prefer venv/bin/yt-dlp if it exists (local to this project)
-        local_yt_dlp = Path(__file__).resolve().parent / "venv" / "bin" / "yt-dlp"
-        self.yt_dlp_cmd = "yt-dlp"
-        if local_yt_dlp.exists():
-            self.yt_dlp_cmd = str(local_yt_dlp)
+    @staticmethod
+    def _windows_path_from_wsl(path: str) -> Path:
+        if os.name != "nt" or not path.startswith("/mnt/") or len(path) < 7:
+            return Path(path)
 
-        try:
-            subprocess.run([self.yt_dlp_cmd, "--version"], capture_output=True, check=True)
-        except (subprocess.CalledProcessError, FileNotFoundError):
-            if self.yt_dlp_cmd != "yt-dlp":
-                 # Try global as fallback
-                 try:
-                     subprocess.run(["yt-dlp", "--version"], capture_output=True, check=True)
-                     self.yt_dlp_cmd = "yt-dlp"
-                     return
-                 except (subprocess.CalledProcessError, FileNotFoundError):
-                     pass
-            raise RuntimeError("yt-dlp not found. Please install yt-dlp.")
+        drive = path[5]
+        rest = path[7:].replace("/", "\\")
+        return Path(f"{drive.upper()}:\\{rest}")
+
+    def _resolve_cookies_file(self, cookies_file=None):
+        candidates = [
+            cookies_file,
+            os.getenv("YT_DLP_COOKIES_FILE"),
+            os.getenv("COOKIES_FILE"),
+        ]
+
+        if os.name == "nt":
+            candidates.extend([
+                str(Path.home() / "Downloads" / "brave_cookies.txt"),
+                "/mnt/c/Users/John/Downloads/brave_cookies.txt",
+            ])
+        else:
+            candidates.extend([
+                str(Path.home() / "Downloads" / "brave_cookies.txt"),
+                "/mnt/c/Users/John/Downloads/brave_cookies.txt",
+            ])
+
+        for candidate in candidates:
+            if not candidate:
+                continue
+            path = self._windows_path_from_wsl(str(candidate))
+            if path.exists():
+                return str(path)
+
+        return None
+
+    def _check_dependencies(self):
+        self.yt_dlp_cmd = resolve_yt_dlp_command()
 
     def extract_video_id(self, url: str) -> str:
         import re
@@ -61,18 +118,17 @@ class YouTubeDownloader:
 
         # Simplified attempt logic for brevity - prioritizing m4a
         cmd = [
-            self.yt_dlp_cmd,
+            *self.yt_dlp_cmd,
             "-f", "bestaudio[ext=m4a]/bestaudio", # Prefer m4a, take whatever is best audio otherwise
-            "-x", "--audio-format", "m4a",        # Force convert to m4a for consistency
-            "--audio-quality", "0",
-            "--cookies", "/mnt/c/Users/John/Downloads/brave_cookies.txt",
             "-o", output_template,
             url
         ]
 
-        if self.cookies_file:
-            cmd.insert(1, "--cookies")
-            cmd.insert(2, self.cookies_file)
+        if self.cookies_file and Path(self.cookies_file).exists():
+            cmd[len(self.yt_dlp_cmd):len(self.yt_dlp_cmd)] = ["--cookies", self.cookies_file]
+            logger.info(f"Using cookies file: {self.cookies_file}")
+        elif self.cookies_file:
+            logger.warning(f"Cookies file not found, continuing without cookies: {self.cookies_file}")
 
         try:
             logger.info(f"Downloading audio for {video_id}...")

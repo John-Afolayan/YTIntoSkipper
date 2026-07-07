@@ -8,6 +8,8 @@ from pathlib import Path
 from datetime import datetime, date
 from typing import Optional, List, Set, Iterator, Tuple
 
+from youtube_downloader import resolve_yt_dlp_command
+
 load_dotenv(dotenv_path=Path(__file__).resolve().parent / ".env")
 
 LOG_LEVEL = os.getenv("POPULATE_LOG_LEVEL", "INFO").upper()
@@ -34,10 +36,11 @@ def _yt_dlp_cmd_for_channel(channel_url: str, fast: bool) -> List[str]:
     fast=True => --flat-playlist (minimal, very fast)
     fast=False => full --dump-json (includes upload_date and other metadata)
     """
+    base_cmd = resolve_yt_dlp_command()
     if fast:
-        return ["yt-dlp", "--yes-playlist", "--flat-playlist", "--skip-download", "--dump-json", channel_url]
+        return [*base_cmd, "--yes-playlist", "--flat-playlist", "--skip-download", "--dump-json", channel_url]
     else:
-        return ["yt-dlp", "--yes-playlist", "--skip-download", "--dump-json", channel_url]
+        return [*base_cmd, "--yes-playlist", "--skip-download", "--dump-json", channel_url]
 
 
 def yt_dlp_stream_list(channel_url: str, fast: bool = True, timeout: int = 900) -> Iterator[dict]:

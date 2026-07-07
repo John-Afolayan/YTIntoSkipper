@@ -12,6 +12,7 @@ from audio_fingerprint import AudioFingerprinter
 from video_db import VideoDB
 from feedback_store import FeedbackStore, REASON_CATEGORIES, REASON_LABELS
 from adaptive_engine import AdaptiveEngine
+from detection_utils import select_best_candidate
 from models import IntroSegment
 from logger import logger
 
@@ -310,6 +311,7 @@ class IntroSkipperAutomator:
             )
 
         candidates.sort(key=lambda x: x["weighted"], reverse=True)
+        best = select_best_candidate(candidates, score_at_zero, logger=logger)
 
         # 4. Always log score at position 0 for diagnostics
         #    This helps understand edge cases where music is laid over the intro.
@@ -318,13 +320,13 @@ class IntroSkipperAutomator:
         # Log all candidates
         logger.info(f"Found {len(candidates)} candidate(s):")
         for i, c in enumerate(candidates[:5]):
-            marker = " <-- best" if i == 0 else ""
+            marker = " <-- selected" if c is best else ""
             logger.info(
                 f"  #{i+1}: {c['time']:.2f}s "
                 f"(Raw: {c['raw']:.3f}, Weighted: {c['weighted']:.3f}){marker}"
             )
-
-        best = candidates[0]
+        if best is None:
+            return None
 
         # 5. Ambiguity detection
         #    If the best match is late (>15s) AND position 0 scores almost as

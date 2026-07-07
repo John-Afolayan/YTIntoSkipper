@@ -11,14 +11,29 @@ from pathlib import Path
 from logger import logger
 
 
-_ffmpeg_available: bool | None = None  # cached check
+_ffmpeg_executable: str | None = None  # cached check
+
+
+def _get_ffmpeg_executable() -> str | None:
+    global _ffmpeg_executable
+    if _ffmpeg_executable is not None:
+        return _ffmpeg_executable
+
+    ffmpeg_path = shutil.which("ffmpeg")
+    if ffmpeg_path:
+        _ffmpeg_executable = ffmpeg_path
+        return _ffmpeg_executable
+
+    try:
+        import imageio_ffmpeg
+        _ffmpeg_executable = imageio_ffmpeg.get_ffmpeg_exe()
+        return _ffmpeg_executable
+    except Exception:
+        return None
 
 
 def _has_ffmpeg() -> bool:
-    global _ffmpeg_available
-    if _ffmpeg_available is None:
-        _ffmpeg_available = shutil.which("ffmpeg") is not None
-    return _ffmpeg_available
+    return _get_ffmpeg_executable() is not None
 
 
 class AudioFingerprinter:
@@ -44,8 +59,12 @@ class AudioFingerprinter:
         """
         tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
         tmp.close()
+        ffmpeg_cmd = _get_ffmpeg_executable()
+        if not ffmpeg_cmd:
+            raise RuntimeError("ffmpeg not found")
+
         cmd = [
-            "ffmpeg", "-y", "-v", "quiet",
+            ffmpeg_cmd, "-y", "-v", "quiet",
             "-i", audio_path,
             "-vn",                # strip video
             "-ac", "1",           # mono
