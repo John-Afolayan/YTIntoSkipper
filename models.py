@@ -10,6 +10,10 @@ class IntroSegment:
     confidence: float
     video_id: str = ""
     video_duration: float = 0.0
+    # True when speech was detected over the START of the matched intro
+    # (while the reference is instrumental there) — submitting this skip
+    # would cut the creator's talking, so it must be manually reviewed.
+    talkover_warning: bool = False
 
     @property
     def duration(self) -> float:

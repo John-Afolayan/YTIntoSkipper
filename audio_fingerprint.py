@@ -139,12 +139,15 @@ class AudioFingerprinter:
             return None
         try:
             d = np.load(str(path), allow_pickle=True)
+            # KeyError on caches written before "speech_env" existed is
+            # caught below -> treated as a cache miss -> regenerated.
             return {
                 "type": str(d["type"]),
                 "data": d["data"],
                 "raw_chroma": d["raw_chroma"],
                 "duration": float(d["duration"]),
                 "sr": int(d["sr"]),
+                "speech_env": d["speech_env"],
             }
         except Exception:
             return None
@@ -160,6 +163,7 @@ class AudioFingerprinter:
             raw_chroma=fp["raw_chroma"],
             duration=fp["duration"],
             sr=fp["sr"],
+            speech_env=fp["speech_env"],
         )
 
     # ------------------------------------------------------------------
@@ -199,6 +203,10 @@ class AudioFingerprinter:
                 "raw_chroma": chroma,
                 "duration": librosa.get_duration(y=y, sr=sr),
                 "sr": sr,
+                # Per-frame speech-band (300Hz-3kHz) energy of the reference
+                # itself. Speech-overlay detection compares the video's tail
+                # against this to find energy the intro doesn't account for.
+                "speech_env": self._speech_band_envelope(y, sr),
             }
 
             # Save to cache
@@ -282,6 +290,69 @@ class AudioFingerprinter:
                     pass
 
     # ------------------------------------------------------------------
+    # Match verification
+    # ------------------------------------------------------------------
+    def verify_match_quality(
+        self,
+        needle_data: dict,
+        video_path: str,
+        start_time: float,
+        sim_threshold: float = 0.70,
+    ) -> dict | None:
+        """
+        Measure how well the reference actually matches the video at a
+        candidate start position, frame by frame.
+
+        Cross-correlation peaks can be inflated by harmonically similar
+        music, especially at position 0. A true intro match keeps high
+        cosine similarity for the FULL reference duration; a false peak
+        collapses after a few seconds. Coverage captures that difference.
+
+        Returns:
+            {"mean_similarity": float, "coverage": float, "frames": int}
+            or None if the audio could not be analysed.
+        """
+        wav_path = None
+        try:
+            duration = needle_data["duration"]
+            ref_chroma = needle_data["raw_chroma"]
+            sr = needle_data["sr"]
+
+            y_vid, _, wav_path = self._load_audio(
+                video_path, offset=start_time, duration=duration,
+            )
+            if len(y_vid) < sr * 1.0:
+                return None
+
+            vid_chroma = librosa.feature.chroma_cqt(y=y_vid, sr=sr)
+
+            min_cols = min(ref_chroma.shape[1], vid_chroma.shape[1])
+            if min_cols < 20:
+                return None
+
+            ref = ref_chroma[:, :min_cols]
+            vid = vid_chroma[:, :min_cols]
+            ref = ref / (np.linalg.norm(ref, axis=0) + 1e-9)
+            vid = vid / (np.linalg.norm(vid, axis=0) + 1e-9)
+            similarity = np.sum(ref * vid, axis=0)
+
+            return {
+                "mean_similarity": float(np.mean(similarity)),
+                "coverage": float(np.mean(similarity >= sim_threshold)),
+                "frames": int(min_cols),
+            }
+
+        except Exception as e:
+            logger.error(f"Match verification failed at {start_time:.2f}s: {e}")
+            return None
+        finally:
+            if wav_path and os.path.exists(wav_path):
+                try:
+                    os.unlink(wav_path)
+                except OSError:
+                    pass
+
+    # ------------------------------------------------------------------
     # Adaptive divergence detection (unchanged logic, robust loading)
     # ------------------------------------------------------------------
     def detect_audio_divergence(
@@ -354,11 +425,234 @@ class AudioFingerprinter:
                     pass
 
     # ------------------------------------------------------------------
+    # Speech-band envelope helper
+    # ------------------------------------------------------------------
+    SPEECH_ENV_N_FFT = 2048
+    SPEECH_ENV_HOP = 512
+
+    @classmethod
+    def _speech_band_envelope(cls, y: np.ndarray, sr: int) -> np.ndarray:
+        """Per-frame energy in the speech band (300Hz-3kHz)."""
+        S = np.abs(librosa.stft(y, n_fft=cls.SPEECH_ENV_N_FFT, hop_length=cls.SPEECH_ENV_HOP))
+        freqs = librosa.fft_frequencies(sr=sr, n_fft=cls.SPEECH_ENV_N_FFT)
+        band = (freqs >= 300) & (freqs <= 3000)
+        return np.sum(S[band, :] ** 2, axis=0)
+
+    @staticmethod
+    def _syllabic_modulation_ratio(envelope: np.ndarray, fs_env: float) -> float | None:
+        """
+        Fraction of the envelope's modulation energy in the syllabic band
+        (3-9 Hz). Speech scores high; music/sound effects score low.
+        Returns None if the envelope is too short to analyse.
+        """
+        if len(envelope) < 32:
+            return None
+        env = envelope / (np.max(envelope) + 1e-12)
+        env = env - np.mean(env)
+        mod_spectrum = np.abs(np.fft.rfft(env)) ** 2
+        mod_freqs = np.fft.rfftfreq(len(env), d=1.0 / fs_env)
+        syllabic = (mod_freqs >= 3.0) & (mod_freqs <= 9.0)
+        broad = (mod_freqs >= 0.5) & (mod_freqs <= 20.0)
+        denom = float(np.sum(mod_spectrum[broad])) + 1e-12
+        return float(np.sum(mod_spectrum[syllabic])) / denom
+
+    # Modulation ratio above this = speech-like. Calibrated on real intro
+    # music (0.07-0.26) vs real speech (mostly 0.31-0.65).
+    SPEECH_MOD_THRESHOLD = 0.35
+
+    # ------------------------------------------------------------------
+    # VAD confirmation for speech-overlay candidates
+    # ------------------------------------------------------------------
+    _vad_warned = False  # class-level: warn about missing webrtcvad only once
+
+    def _vad_confirms_speech(
+        self,
+        seg: np.ndarray,
+        sr: int,
+        min_speech_frames: int = 6,
+    ) -> bool | None:
+        """
+        Run webrtcvad over a confirmation window (sliced by the caller) and
+        report whether it contains actual speech.
+
+        Returns True (speech), False (no speech), or None (VAD unavailable
+        or too little audio — caller decides the fallback).
+        """
+        try:
+            import webrtcvad
+        except ImportError:
+            if not AudioFingerprinter._vad_warned:
+                logger.warning(
+                    "webrtcvad not installed — speech-overlay confirmation "
+                    "falls back to syllabic-modulation analysis. Install it "
+                    "for more reliable results: pip install webrtcvad-wheels"
+                )
+                AudioFingerprinter._vad_warned = True
+            return None
+
+        try:
+            target_sr = 16000
+            if len(seg) < sr * 0.4:
+                return None  # not enough audio to judge
+
+            seg16 = librosa.resample(seg, orig_sr=sr, target_sr=target_sr)
+            pcm = np.clip(seg16 * 32767.0, -32768, 32767).astype(np.int16)
+
+            # Mode 3 = most aggressive at filtering out non-speech; with
+            # music underneath we'd rather miss borderline speech than trim
+            # on a sound effect.
+            vad = webrtcvad.Vad(3)
+            frame_len = int(target_sr * 0.03)  # 30ms frames
+            speech_frames = 0
+            total_frames = 0
+            for i in range(0, len(pcm) - frame_len + 1, frame_len):
+                frame = pcm[i:i + frame_len].tobytes()
+                total_frames += 1
+                if vad.is_speech(frame, target_sr):
+                    speech_frames += 1
+
+            if total_frames == 0:
+                return None
+            return speech_frames >= min_speech_frames
+
+        except Exception as e:
+            logger.debug(f"VAD confirmation failed: {e}")
+            return None
+
+    def _modulation_confirms_speech(
+        self,
+        seg: np.ndarray,
+        sr: int,
+        ratio_threshold: float = 0.35,
+    ) -> bool | None:
+        """
+        Fallback speech confirmation when webrtcvad is unavailable.
+
+        Speech carries strong 3-9 Hz amplitude modulation in the speech band
+        (the syllable rate). Sound effects, risers, and music sweeps have
+        smooth or slow envelopes and score low. Calibrated on real intro
+        music (0.07-0.26) vs real speech (mostly 0.31-0.65); 0.35 rejects
+        all music samples — a false "no" here only means no trim, which is
+        the safe direction.
+
+        Returns True (speech-like modulation), False (not speech-like),
+        or None (too little audio to judge).
+        """
+        try:
+            if len(seg) < sr * 1.0:
+                return None  # need >= ~1s for 3 Hz modulation resolution
+
+            envelope = self._speech_band_envelope(seg, sr)
+            fs_env = sr / self.SPEECH_ENV_HOP  # envelope sample rate (~43 Hz)
+            ratio = self._syllabic_modulation_ratio(envelope, fs_env)
+            if ratio is None:
+                return None
+
+            logger.debug(f"Syllabic modulation ratio: {ratio:.3f}")
+            return ratio >= ratio_threshold
+
+        except Exception as e:
+            logger.debug(f"Modulation speech check failed: {e}")
+            return None
+
+    # ------------------------------------------------------------------
+    # Talk-over-at-start detection
+    # ------------------------------------------------------------------
+    # Sub-window size matches the calibration of SPEECH_MOD_THRESHOLD —
+    # the modulation-spectrum distribution shifts with window length.
+    SPEECH_WINDOW_SEC = 1.6
+    SPEECH_WINDOW_HOP_SEC = 0.8
+
+    def detect_talkover_at_start(
+        self,
+        needle_data: dict,
+        video_path: str,
+        match_start_time: float,
+        head_seconds: float = 4.0,
+        min_speech_windows: int = 2,
+    ) -> bool:
+        """
+        Detect whether the creator is speaking over the HEAD of the matched
+        intro. If the reference intro is instrumental at that point but the
+        video has speech there, the match is a talk-over — skipping it
+        would cut the creator's talking.
+
+        Scans the head in overlapping 1.6s sub-windows and requires
+        `min_speech_windows` speech-like windows to reduce false alarms.
+        The check disables itself (returns False) when the reference intro
+        contains vocals in its head, since speech detection can't
+        distinguish the creator from the intro's own singing.
+
+        Returns True only when talk-over is confidently detected.
+        """
+        wav_path = None
+        try:
+            sr = needle_data["sr"]
+            intro_duration = needle_data["duration"]
+            ref_env = needle_data.get("speech_env")
+            if ref_env is None:
+                return False
+
+            head = min(head_seconds, intro_duration - 0.5)
+            win = self.SPEECH_WINDOW_SEC
+            hop_w = self.SPEECH_WINDOW_HOP_SEC
+            if head < win:
+                return False
+
+            fs_env = sr / self.SPEECH_ENV_HOP
+            window_starts = np.arange(0.0, head - win + 0.01, hop_w)
+
+            # Reference vocal check: any speech-like sub-window in the
+            # reference head means we can't judge — stay quiet.
+            for w in window_starts:
+                seg_env = ref_env[int(w * fs_env):int((w + win) * fs_env)]
+                r = self._syllabic_modulation_ratio(seg_env, fs_env)
+                if r is not None and r >= self.SPEECH_MOD_THRESHOLD:
+                    logger.debug(
+                        f"Reference intro head is speech-like at +{w:.1f}s "
+                        f"(ratio {r:.2f}) — talk-over check disabled."
+                    )
+                    return False
+
+            y, _, wav_path = self._load_audio(
+                video_path, offset=match_start_time, duration=head,
+            )
+            if len(y) < sr * win:
+                return False
+
+            votes = 0
+            for w in window_starts:
+                seg = y[int(w * sr):int((w + win) * sr)]
+                if len(seg) < sr * 1.0:
+                    continue
+                says_speech = self._vad_confirms_speech(seg, sr)
+                if says_speech is None:
+                    says_speech = self._modulation_confirms_speech(seg, sr)
+                if says_speech:
+                    votes += 1
+                    if votes >= min_speech_windows:
+                        return True
+
+            return False
+
+        except Exception as e:
+            logger.debug(f"Talk-over check failed: {e}")
+            return False
+        finally:
+            if wav_path and os.path.exists(wav_path):
+                try:
+                    os.unlink(wav_path)
+                except OSError:
+                    pass
+
+    # ------------------------------------------------------------------
     # Speech-over-intro detection
-    # Compares speech-band energy (300Hz-3kHz) between the reference
-    # intro and the video. A sudden excess in the video's speech band
-    # that wasn't in the reference = someone talking over the intro.
-    # Only scans the TAIL of the intro to stay conservative.
+    # Compares the video's speech-band energy (300Hz-3kHz) against the
+    # REFERENCE INTRO's own speech-band envelope, frame-aligned and
+    # gain-calibrated. Energy the intro itself doesn't account for =
+    # someone talking over it. Only scans the TAIL of the intro to stay
+    # conservative, and every energy candidate must be confirmed as
+    # actual speech (VAD, or syllabic modulation as fallback).
     # ------------------------------------------------------------------
     def detect_speech_overlay(
         self,
@@ -367,33 +661,34 @@ class AudioFingerprinter:
         match_start_time: float,
         tail_seconds: float = 4.0,
         min_trim: float = 0.3,
-        speech_ratio_threshold: float = 1.8,
+        excess_energy_threshold: float = 2.0,
         consecutive_frames_required: int = 4,
     ) -> float | None:
         """
         Detect where a speaker starts talking over the intro music.
 
         Strategy:
-          1. Load the tail end of both the reference intro and the video
-             at the matched position.
-          2. Compute short-time energy in the speech band (300Hz-3kHz)
-             for both signals.
-          3. Compute the ratio: video_speech_energy / ref_speech_energy.
-             Where this ratio is consistently > threshold, the speaker
-             has started talking.
-          4. Return the absolute timestamp where speech begins, or None.
+          1. The fingerprint stores the reference intro's per-frame
+             speech-band energy envelope ("speech_env").
+          2. Calibrate the video's gain against the reference using the
+             EARLY part of the matched intro (known speech-free).
+          3. In the tail, compute per-frame excess:
+                 video_energy / (gain * reference_energy)
+             Consistent excess above threshold = added sound.
+          4. Confirm the added sound is speech (VAD, or syllabic-modulation
+             fallback) before reporting it.
 
         Args:
-            needle_data: Reference fingerprint data.
+            needle_data: Reference fingerprint data (must contain speech_env).
             video_path: Path to the downloaded video audio.
             match_start_time: Where the intro was detected in the video.
             tail_seconds: How many seconds from the end of the intro to scan.
             min_trim: Minimum seconds to trim (ignore detections smaller than this).
-            speech_ratio_threshold: How much more speech-band energy the video
-                must have vs the reference to count as "speech overlay".
-                1.8 = 80% more energy. Higher = more conservative.
+            excess_energy_threshold: How much more speech-band energy the video
+                must have vs the gain-scaled reference to count as an overlay
+                candidate. 2.0 = double the energy. Higher = more conservative.
             consecutive_frames_required: How many consecutive frames must
-                exceed the threshold to confirm speech. Higher = fewer
+                exceed the threshold to flag a candidate. Higher = fewer
                 false positives but might miss very short speech.
 
         Returns:
@@ -404,6 +699,14 @@ class AudioFingerprinter:
         try:
             intro_duration = needle_data["duration"]
             sr = needle_data["sr"]
+            ref_env_full = needle_data.get("speech_env")
+            if ref_env_full is None:
+                logger.warning(
+                    "Fingerprint has no speech_env (stale cache?) — "
+                    "speech-overlay detection skipped. Delete .fingerprint_cache "
+                    "to regenerate."
+                )
+                return None
 
             # Only scan the tail portion of the intro
             scan_duration = min(tail_seconds, intro_duration - 1.0)
@@ -411,25 +714,7 @@ class AudioFingerprinter:
                 return None  # intro too short to meaningfully scan
 
             tail_offset_in_intro = intro_duration - scan_duration
-
-            # Load reference tail
-            ref_path = None  # We need the original reference audio path...
-            # But we don't have it — we have the fingerprint data.
-            # So instead, recompute from raw_chroma which we already have.
-            # Actually, we need the raw waveform. Let's load from video
-            # at the matched position and compare spectral shape.
-
-            # Reference: load from match_start + tail_offset
             ref_start = match_start_time + tail_offset_in_intro
-
-            # We need both the reference audio file and the video.
-            # Since we only have the fingerprint (not the reference path),
-            # we'll compare the video's speech band against the reference's
-            # chroma to detect new energy. But a cleaner approach:
-            # store the reference waveform's speech-band profile during
-            # fingerprint generation. For now, use a simpler approach:
-            # compute the speech-band energy of the reference from its
-            # raw_chroma, and compare to the video.
 
             # --- Load video tail audio ---
             y_vid, _, vid_tmp = self._load_audio(
@@ -439,35 +724,10 @@ class AudioFingerprinter:
             if len(y_vid) < sr * 0.5:
                 return None  # too little audio
 
-            # --- Compute STFT for the video ---
-            n_fft = 2048
-            hop = 512
-            S_vid = np.abs(librosa.stft(y_vid, n_fft=n_fft, hop_length=hop))
-            freqs = librosa.fft_frequencies(sr=sr, n_fft=n_fft)
+            hop = self.SPEECH_ENV_HOP
+            env_vid = self._speech_band_envelope(y_vid, sr)
 
-            # Speech band: 300Hz - 3kHz
-            speech_mask = (freqs >= 300) & (freqs <= 3000)
-            # Non-speech band: everything else (music tends to dominate here)
-            nonspeech_mask = ~speech_mask & (freqs > 50)  # skip DC/rumble
-
-            # Per-frame energy in each band
-            speech_energy = np.sum(S_vid[speech_mask, :] ** 2, axis=0)
-            nonspeech_energy = np.sum(S_vid[nonspeech_mask, :] ** 2, axis=0)
-
-            # Spectral ratio: proportion of energy in speech band
-            total_energy = speech_energy + nonspeech_energy + 1e-12
-            speech_ratio = speech_energy / total_energy
-
-            # --- Now we need a baseline: what does the reference intro's
-            # speech ratio look like? We can estimate it from the raw_chroma.
-            # But chroma doesn't directly give us speech-band energy.
-            #
-            # Better approach: compute a BASELINE from the EARLY part of
-            # this same video's matched intro (where we know there's no
-            # speech overlay). This is self-referencing and robust.
-            # ---
-
-            # Load the EARLY part of the intro in this video (first 2-3 sec)
+            # --- Gain calibration on the EARLY (speech-free) intro part ---
             baseline_duration = min(3.0, intro_duration - scan_duration - 0.5)
             if baseline_duration < 1.0:
                 return None
@@ -475,24 +735,42 @@ class AudioFingerprinter:
             y_baseline, _, ref_tmp = self._load_audio(
                 video_path, offset=match_start_time, duration=baseline_duration,
             )
+            env_base_vid = self._speech_band_envelope(y_baseline, sr)
 
-            S_baseline = np.abs(librosa.stft(y_baseline, n_fft=n_fft, hop_length=hop))
-            baseline_speech = np.sum(S_baseline[speech_mask, :] ** 2, axis=0)
-            baseline_nonspeech = np.sum(S_baseline[nonspeech_mask, :] ** 2, axis=0)
-            baseline_total = baseline_speech + baseline_nonspeech + 1e-12
-            baseline_ratio = np.median(baseline_speech / baseline_total)
+            fs_env = sr / hop
+            ref_env_early = ref_env_full[:len(env_base_vid)]
+            ref_early_med = float(np.median(ref_env_early))
+            if ref_early_med <= 1e-12:
+                return None  # degenerate reference
+            gain = float(np.median(env_base_vid)) / ref_early_med
+            if gain <= 0:
+                return None
 
-            if baseline_ratio < 1e-6:
-                return None  # degenerate case
+            # --- Frame-aligned excess energy in the tail ---
+            tail_start_frame = int(round(tail_offset_in_intro * fs_env))
+            ref_env_tail = ref_env_full[tail_start_frame:tail_start_frame + len(env_vid)]
+            n = min(len(ref_env_tail), len(env_vid))
+            if n < consecutive_frames_required + 2:
+                return None
+
+            from scipy.signal import medfilt
+            env_vid_s = medfilt(env_vid[:n], kernel_size=5)
+            ref_scaled = medfilt(gain * ref_env_tail[:n], kernel_size=5)
+            # Floor keeps quiet reference moments (fade-outs) from exploding
+            # the ratio on noise alone.
+            floor = 0.05 * (float(np.median(ref_scaled)) + 1e-12)
+            excess = env_vid_s / (ref_scaled + floor)
 
             # --- Scan for speech onset ---
-            # We look for frames where the speech ratio is significantly
-            # higher than the baseline (intro-only) ratio.
+            # Consistent excess energy the intro doesn't account for is an
+            # overlay CANDIDATE. It must then be confirmed as actual speech —
+            # otherwise a bass drop, riser, or sound effect in the intro
+            # tail would trigger a bogus trim.
             consecutive = 0
-            for frame_idx in range(len(speech_ratio)):
-                ratio_vs_baseline = speech_ratio[frame_idx] / (baseline_ratio + 1e-9)
+            for frame_idx in range(n):
+                ratio_vs_baseline = excess[frame_idx]
 
-                if ratio_vs_baseline >= speech_ratio_threshold:
+                if ratio_vs_baseline >= excess_energy_threshold:
                     consecutive += 1
                 else:
                     # Slow decay: allow 1 frame gap (speech can have
@@ -500,7 +778,7 @@ class AudioFingerprinter:
                     consecutive = max(0, consecutive - 1)
 
                 if consecutive >= consecutive_frames_required:
-                    # Speech confirmed — calculate timestamp
+                    # Energy candidate — calculate timestamp
                     onset_frame = frame_idx - consecutive_frames_required + 1
                     time_in_tail = librosa.frames_to_time(
                         onset_frame, sr=sr, hop_length=hop,
@@ -516,10 +794,36 @@ class AudioFingerprinter:
                         )
                         return None
 
+                    # --- Speech confirmation: VAD first, syllabic
+                    # modulation as fallback when VAD is unavailable ---
+                    # The window stays INSIDE the intro tail: sliding it
+                    # earlier for near-end candidates avoids two problems —
+                    # windows too short to analyse, and contamination from
+                    # normal post-intro speech just past the intro end.
+                    tail_len_sec = len(y_vid) / sr
+                    win_start = max(0.0, min(time_in_tail - 0.2, tail_len_sec - 1.0))
+                    win_end = min(time_in_tail + 1.4, tail_len_sec)
+                    confirm_seg = y_vid[int(win_start * sr):int(win_end * sr)]
+
+                    vad_says_speech = self._vad_confirms_speech(confirm_seg, sr)
+                    if vad_says_speech is None:
+                        vad_says_speech = self._modulation_confirms_speech(
+                            confirm_seg, sr,
+                        )
+                    if vad_says_speech is False:
+                        logger.info(
+                            f"Energy spike at {absolute_time:.2f}s "
+                            f"(excess={ratio_vs_baseline:.2f}x) NOT confirmed as "
+                            f"speech — likely a sound effect. Continuing scan."
+                        )
+                        consecutive = 0
+                        continue
+
+                    confirmation = "speech-confirmed" if vad_says_speech else "energy-only"
                     logger.info(
                         f"Speech overlay detected at {absolute_time:.2f}s "
-                        f"(trimming {trim_amount:.2f}s from end of intro, "
-                        f"ratio={ratio_vs_baseline:.2f}x baseline)"
+                        f"({confirmation}, trimming {trim_amount:.2f}s from end "
+                        f"of intro, ratio={ratio_vs_baseline:.2f}x baseline)"
                     )
                     return absolute_time
 

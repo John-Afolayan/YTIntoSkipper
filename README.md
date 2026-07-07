@@ -4,12 +4,13 @@ Automated YouTube intro detection and [SponsorBlock](https://sponsor.ajay.app/) 
 
 ## How It Works
 
-1. **Reference fingerprinting** — You provide one or more audio files of the channel's intro music. The tool generates a chroma-based fingerprint for each.
+1. **Reference fingerprinting** — You provide one or more audio files of the channel's intro music. The tool generates a chroma-based fingerprint for each (plus a speech-band energy envelope used for speech detection).
 2. **Video scanning** — For each target video, the tool downloads the first N seconds of audio (default: 120s) and runs normalized cross-correlation against the reference fingerprint(s).
-3. **Candidate ranking** — Correlation peaks are scored with position weighting (earlier matches score higher). Ambiguity detection identifies overlapping intro music at position 0.
-4. **Boundary refinement** — Adaptive divergence detection trims the end point by comparing frame-by-frame cosine similarity between the reference and video. Optional speech-overlay detection (`--trim-speech`) detects when the creator starts talking over the intro tail.
-5. **Adaptive learning** — When `--channel-id` is provided, the system records feedback from approvals and denials, builds per-channel profiles, and applies statistical corrections to improve future accuracy over time.
-6. **Submission** — Confident detections are submitted to SponsorBlock as "intro" segments. Medium-confidence detections require manual review.
+3. **Candidate ranking** — Correlation peaks are scored with position weighting (earlier matches score higher). When a position-0 candidate and a strong delayed candidate compete, **match verification** (frame-wise cosine similarity over the full intro duration) arbitrates — so delayed intros (e.g. an intro starting 60s in) are no longer misattributed to 0:00. Ambiguity between overlapping intro music at 0s and a late match is also resolved by verification where the evidence is decisive.
+4. **Talk-over guard** — If the creator is speaking over the head of the matched intro (while the reference is instrumental there), the detection is capped at medium confidence and forced into manual review so the skip can't cut the talking.
+5. **Boundary refinement** — Adaptive divergence detection trims the end point by comparing frame-by-frame cosine similarity between the reference and video. Optional speech-overlay detection (`--trim-speech`) finds energy in the intro tail that the reference doesn't account for, then confirms it is actual speech (webrtcvad, or a syllabic-modulation fallback) before trimming — sound effects and bass drops no longer trigger trims.
+6. **Adaptive learning** — When `--channel-id` is provided, the system records feedback from approvals and denials, builds per-channel profiles, and applies statistical corrections to improve future accuracy over time.
+7. **Submission** — Confident detections are submitted to SponsorBlock as "intro" segments. Medium-confidence detections require manual review.
 
 ## Requirements
 
@@ -125,7 +126,7 @@ python main.py --reference-intro intro.m4a --urls-file urls.txt --dry-run
 | `--manual-approval` | Require confirmation before each submission |
 | `--dry-run` | Detect intros but don't submit |
 | `--clipboard` | Copy video URL with timestamp during manual approval |
-| `--trim-speech` | Detect speech over intro tail and trim the skip endpoint |
+| `--trim-speech` | Detect speech over intro tail (speech-confirmed via VAD/modulation) and trim the skip endpoint |
 
 ### Tuning
 
@@ -230,7 +231,8 @@ Environment variables (`CHANNEL_URL`, `DATE_FROM`, `DATE_TO`) can also be set in
 .
 ├── main.py                 # CLI entry point and argument parsing
 ├── automator.py            # Core orchestration (detection + submission pipeline)
-├── audio_fingerprint.py    # Chroma fingerprinting, cross-correlation, divergence detection
+├── audio_fingerprint.py    # Chroma fingerprinting, cross-correlation, verification, speech detection
+├── detection_utils.py      # Candidate selection + verification arbitration (pure logic, unit-tested)
 ├── sponsorblock_api.py     # SponsorBlock API client with retry logic
 ├── youtube_downloader.py   # yt-dlp wrapper for audio downloading
 ├── video_db.py             # SQLite tracker for processed videos (deduplication)
@@ -253,6 +255,8 @@ Environment variables (`CHANNEL_URL`, `DATE_FROM`, `DATE_TO`) can also be set in
 ## Tips
 
 - **Start with `--manual-approval --dry-run`** to verify detection quality before submitting anything.
+- **After upgrading, clear `.fingerprint_cache/`** once (or just let stale entries regenerate automatically) — fingerprints now include a speech-band envelope used by the speech and talk-over detectors.
+- **Install `webrtcvad-wheels`** for the most reliable speech confirmation; without it the tool falls back to a built-in syllabic-modulation analysis (no extra dependencies). Note: no prebuilt wheels exist for Python 3.14 yet.
 - **Use `--clipboard`** during manual review to quickly open the video at the detected timestamp.
 - **Enable `--channel-id` from the start** so the learning system accumulates data even during initial manual runs.
 - **Multiple references help** when a channel has intro variations (different lengths, remixes, etc.).

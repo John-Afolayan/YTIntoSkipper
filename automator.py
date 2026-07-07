@@ -12,7 +12,7 @@ from audio_fingerprint import AudioFingerprinter
 from video_db import VideoDB
 from feedback_store import FeedbackStore, REASON_CATEGORIES, REASON_LABELS
 from adaptive_engine import AdaptiveEngine
-from detection_utils import select_best_candidate
+from detection_utils import select_start_candidate, resolve_ambiguity
 from models import IntroSegment
 from logger import logger
 
@@ -269,7 +269,13 @@ class IntroSkipperAutomator:
             return None
 
         # 2. Peaks
-        peaks, _ = find_peaks(scores, height=self.peak_height, distance=sr * 2)
+        #    `distance` is measured in CHROMA FRAMES (hop_length samples
+        #    each), not audio samples. Require ~2 seconds between peaks:
+        #    2 * sr / hop_length frames. (The previous `sr * 2` value was
+        #    ~17 minutes of frames, which silently limited every scan to a
+        #    single peak — delayed intros never even became candidates.)
+        min_peak_distance = max(1, int(2.0 * sr / hop_length))
+        peaks, _ = find_peaks(scores, height=self.peak_height, distance=min_peak_distance)
         if len(peaks) == 0:
             return None
 
@@ -311,7 +317,31 @@ class IntroSkipperAutomator:
             )
 
         candidates.sort(key=lambda x: x["weighted"], reverse=True)
-        best = select_best_candidate(candidates, score_at_zero, logger=logger)
+
+        # Verification callback: measures how well the reference ACTUALLY
+        # matches the video at a given start (frame-wise cosine coverage).
+        # Cached per position — arbitration and ambiguity resolution may ask
+        # about the same timestamp.
+        verify_cache: dict = {}
+
+        def _verify(start_time: float):
+            key = round(start_time, 2)
+            if key not in verify_cache:
+                result = self.fingerprinter.verify_match_quality(
+                    ref_data, audio_path, start_time,
+                )
+                if result:
+                    logger.info(
+                        f"  Verify @ {start_time:.2f}s: "
+                        f"coverage={result['coverage']:.2f}, "
+                        f"mean_sim={result['mean_similarity']:.2f}"
+                    )
+                verify_cache[key] = result
+            return verify_cache[key]
+
+        best = select_start_candidate(
+            candidates, score_at_zero, verify_fn=_verify, logger=logger,
+        )
 
         # 4. Always log score at position 0 for diagnostics
         #    This helps understand edge cases where music is laid over the intro.
@@ -350,9 +380,22 @@ class IntroSkipperAutomator:
                     f"AMBIGUOUS: best match at {best['time']:.2f}s (Raw: {best['raw']:.3f}) "
                     f"but position 0 also scores {score_at_zero:.3f} "
                     f"(ratio: {ratio:.2f} >= {AMBIGUITY_RATIO_THRESHOLD}). "
-                    f"Likely music overlaid on intro at 0s. Skipping for manual review."
+                    f"Verifying both positions against the reference..."
                 )
-                return None
+                decision = resolve_ambiguity(best["time"], 0.0, _verify, logger=logger)
+                if decision == "zero":
+                    zero_pool = [c for c in candidates if c["time"] == 0.0]
+                    best = max(zero_pool, key=lambda c: c["raw"], default=None) or {
+                        "time": 0.0,
+                        "raw": score_at_zero,
+                        "weighted": score_at_zero + self._position_weight(0.0),
+                        "frame": 0,
+                    }
+                elif decision != "best":
+                    logger.warning(
+                        "Still ambiguous after verification. Skipping for manual review."
+                    )
+                    return None
             else:
                 logger.info(
                     f"Position 0 scores {score_at_zero:.3f} vs best {best['raw']:.3f} "
@@ -389,6 +432,21 @@ class IntroSkipperAutomator:
         raw_confidence = best["raw"]
         intro_dur = ref_data["duration"]
         end_time = start_time + intro_dur
+
+        # 3.5 Talk-over guard: if the creator is speaking over the START of
+        #     the matched intro (and the reference is instrumental there),
+        #     submitting this skip would cut the talking. Cap confidence
+        #     below the auto-submit tier so it always gets manual review.
+        talkover = self.fingerprinter.detect_talkover_at_start(
+            ref_data, audio_path, start_time,
+        )
+        if talkover:
+            logger.warning(
+                f"Speech detected over the start of the matched intro at "
+                f"{start_time:.2f}s — likely talk-over content. Forcing "
+                f"manual review."
+            )
+            raw_confidence = min(raw_confidence, self.CONFIDENCE_HIGH - 0.01)
 
         # 4. Adaptive Divergence Check
         actual_end_timestamp = self.fingerprinter.detect_audio_divergence(
@@ -443,7 +501,8 @@ class IntroSkipperAutomator:
             start_time=start_time,
             end_time=end_time,
             confidence=raw_confidence,
-            video_duration=video_duration
+            video_duration=video_duration,
+            talkover_warning=talkover,
         )
 
     # ------------------------------------------------------------------
@@ -648,6 +707,9 @@ class IntroSkipperAutomator:
         print(f"Detected intro: {segment.start_time:.2f}s - {segment.end_time:.2f}s")
         print(f"Duration: {segment.end_time - segment.start_time:.2f}s")
         print(f"Confidence: {segment.confidence:.2f} ({tier})")
+        if getattr(segment, "talkover_warning", False):
+            print("*** WARNING: speech detected over the start of this intro — "
+                  "the creator may be talking over it. Verify before submitting! ***")
         print(f"{'=' * 60}")
 
     def _get_user_confirmation(self):
