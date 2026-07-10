@@ -91,6 +91,18 @@ def main():
     parser.add_argument("--trim-speech", action="store_true",
                         help="Detect when the YouTuber talks over the end of the intro and trim the skip point earlier")
 
+    # --- Re-processing (audit existing submissions) ---
+    parser.add_argument("--reprocess", action="store_true",
+                        help="Audit existing SponsorBlock intro submissions: re-analyze each video, "
+                             "propose corrections for divergent segments, and resubmit on approval")
+    parser.add_argument("--ignore-cache", action="store_true",
+                        help="With --reprocess: re-audit every video, ignoring the reprocess cache")
+    parser.add_argument("--diff-threshold", type=float, default=0.5,
+                        help="With --reprocess: propose a correction when start or end differs "
+                             "by at least this many seconds (default: 0.5)")
+    parser.add_argument("--reprocess-stats", action="store_true",
+                        help="Print reprocess (audit) cache statistics and exit")
+
     # --- Tuning ---
     parser.add_argument("--peak-height", type=float, default=0.25,
                         help="Minimum raw correlation peak height (default: 0.25)")
@@ -149,6 +161,20 @@ def main():
         db.reset()
         print("Database cleared.")
         db.close()
+        return
+
+    if args.reprocess_stats:
+        from reprocessor import ReprocessCache
+        cache = ReprocessCache(args.db)
+        stats = cache.get_stats()
+        if stats:
+            print("Reprocess (audit) cache stats:")
+            for status, count in sorted(stats.items()):
+                print(f"  {status}: {count}")
+            print(f"  TOTAL: {sum(stats.values())}")
+        else:
+            print("No audited videos yet.")
+        cache.close()
         return
 
     if args.db_reset_errors:
@@ -295,13 +321,31 @@ def main():
     logger.info(f"SPONSORBLOCK_USER_ID = {sb_uid}")
     print(f"SPONSORBLOCK_USER_ID = {sb_uid}")
 
+    if args.channel:
+        source = url_generator_from_channel(args.channel)
+    else:
+        source = url_generator_from_file(args.urls_file)
+
+    if args.reprocess:
+        # Audit mode: interactive by design, always sequential
+        from reprocessor import IntroReprocessor
+        reprocessor = IntroReprocessor(
+            automator,
+            diff_threshold=args.diff_threshold,
+            ignore_cache=args.ignore_cache,
+            dry_run=args.dry_run,
+            clipboard=args.clipboard,
+            db_path=args.db,
+        )
+        try:
+            reprocessor.reprocess_from_source(source)
+        finally:
+            reprocessor.cleanup()
+            automator.cleanup()
+        return
+
     try:
-        if args.channel:
-            source = url_generator_from_channel(args.channel)
-            automator.process_from_source(source)
-        else:
-            source = url_generator_from_file(args.urls_file)
-            automator.process_from_source(source)
+        automator.process_from_source(source)
     finally:
         automator.cleanup()
 

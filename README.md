@@ -108,6 +108,26 @@ Detect intros without submitting to SponsorBlock:
 python main.py --reference-intro intro.m4a --urls-file urls.txt --dry-run
 ```
 
+### Re-processing / Auditing Existing Submissions
+
+Fix videos that were automated with poorly analyzed submissions. Audit mode re-analyzes each video that already has an intro segment on SponsorBlock, compares the live submission against the current detector's suggestion, and interactively proposes corrections:
+
+```bash
+# Respects the audit cache (previously audited videos are skipped)
+python main.py --reprocess --reference-intro intro.m4a --channel "https://www.youtube.com/@ChannelName"
+
+# Ignore the cache and re-audit everything
+python main.py --reprocess --ignore-cache --reference-intro intro.m4a --channel "https://www.youtube.com/@ChannelName"
+```
+
+- Submissions within `--diff-threshold` seconds (default 0.5) of the suggestion are recorded as OK and skipped; small jitter (±0.05s) is never flagged.
+- Divergent videos show a side-by-side comparison and wait for `y`/`n` approval before anything is changed.
+- Approved corrections on **our own** segments are removed and resubmitted. Segments submitted by **other userIDs** (e.g. old random one-time IDs) cannot be removed — they are downvoted and the correction is submitted alongside, then listed for manual attention at the end of the run.
+- The audit cache is a separate table from the main pipeline's dedup DB; `--reprocess-stats` shows its contents.
+- `--dry-run` and `--clipboard` also work in audit mode.
+
+See [REPROCESSING.md](REPROCESSING.md) for the full design, the SponsorBlock ownership problem, and limitations.
+
 ## CLI Reference
 
 ### Input Options
@@ -127,6 +147,15 @@ python main.py --reference-intro intro.m4a --urls-file urls.txt --dry-run
 | `--dry-run` | Detect intros but don't submit |
 | `--clipboard` | Copy video URL with timestamp during manual approval |
 | `--trim-speech` | Detect speech over intro tail (speech-confirmed via VAD/modulation) and trim the skip endpoint |
+
+### Re-processing (Audit)
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--reprocess` | | Audit existing SponsorBlock submissions and propose corrections |
+| `--ignore-cache` | | Re-audit videos already in the reprocess cache |
+| `--diff-threshold SECS` | 0.5 | Propose a correction when start or end differs by at least this much |
+| `--reprocess-stats` | | Print audit cache statistics and exit |
 
 ### Tuning
 
@@ -168,6 +197,8 @@ python main.py --reference-intro intro.m4a --urls-file urls.txt --dry-run
 | `--user-id UUID` | Override SponsorBlock user ID |
 | `--list-segments VIDEO_ID` | List all intro segments for a video |
 | `--delete-video VIDEO_ID` | Delete intro segments for a video (not yet implemented) |
+
+Note: SponsorBlock only lets a segment be removed by the userID that submitted it. Segments submitted under other (e.g. one-time random) IDs can only be downvoted and out-competed — see [REPROCESSING.md](REPROCESSING.md).
 
 ## Adaptive Learning System
 
@@ -234,6 +265,7 @@ Environment variables (`CHANNEL_URL`, `DATE_FROM`, `DATE_TO`) can also be set in
 ├── audio_fingerprint.py    # Chroma fingerprinting, cross-correlation, verification, speech detection
 ├── detection_utils.py      # Candidate selection + verification arbitration (pure logic, unit-tested)
 ├── sponsorblock_api.py     # SponsorBlock API client with retry logic
+├── reprocessor.py          # Audit mode: re-check + fix existing submissions (own cache)
 ├── youtube_downloader.py   # yt-dlp wrapper for audio downloading
 ├── video_db.py             # SQLite tracker for processed videos (deduplication)
 ├── feedback_store.py       # Feedback and channel profile storage

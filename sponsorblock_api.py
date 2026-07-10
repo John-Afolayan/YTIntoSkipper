@@ -35,6 +35,19 @@ class SponsorBlockAPI:
         import uuid
         return str(uuid.uuid4())
 
+    def get_public_user_id(self) -> str:
+        """
+        Derive the public userID from the private one.
+        SponsorBlock defines publicID = sha256(privateID) applied 5000 times.
+        Used to check whether an existing segment was submitted by us.
+        """
+        if not hasattr(self, "_public_user_id"):
+            pub = self.user_id
+            for _ in range(5000):
+                pub = hashlib.sha256(pub.encode()).hexdigest()
+            self._public_user_id = pub
+        return self._public_user_id
+
     @staticmethod
     def _is_retryable(exc_or_status):
         """Determine if an error is transient and worth retrying."""
@@ -79,16 +92,19 @@ class SponsorBlockAPI:
 
     def submit_segment(self, video_id: str, start_time: float, end_time: float,
                        category: str = "intro", action_type: str = "skip",
-                       video_duration: float = None) -> bool:
-        
-        # Guard: Check if a similar segment already exists
-        existing = self.get_segments(video_id)
-        for s in existing:
-            if s.get("category") == category:
-                seg = s.get("segment", [0, 0])
-                if abs(seg[0] - start_time) < 2.5 and abs(seg[1] - end_time) < 2.5:
-                    logger.info(f"Similar {category} segment already exists. Skipping.")
-                    return True
+                       video_duration: float = None, force: bool = False) -> bool:
+
+        # Guard: Check if a similar segment already exists.
+        # `force=True` bypasses this — needed when intentionally replacing an
+        # existing segment with a correction that differs by less than 2.5s.
+        if not force:
+            existing = self.get_segments(video_id)
+            for s in existing:
+                if s.get("category") == category:
+                    seg = s.get("segment", [0, 0])
+                    if abs(seg[0] - start_time) < 2.5 and abs(seg[1] - end_time) < 2.5:
+                        logger.info(f"Similar {category} segment already exists. Skipping.")
+                        return True
 
         url = f"{self.base_url}/skipSegments"
         
@@ -147,20 +163,59 @@ class SponsorBlockAPI:
             logger.error(f"API request failed after retries: {e}")
             return []
 
-    def delete_segment(self, segment_uuid: str) -> bool:
-        # base_url already includes /api
-        url = f"{self.base_url}/skipSegments/{segment_uuid}"
-        data = {"userID": self.user_id}
-
+    def get_segment_info(self, uuids):
+        """
+        Fetch full metadata for one or more segments (by UUID), including the
+        submitter's PUBLIC userID, vote count and locked status.
+        Returns a list of segment-info dicts (empty on failure).
+        """
+        if isinstance(uuids, str):
+            uuids = [uuids]
+        url = f"{self.base_url}/segmentInfo"
+        params = {"UUIDs": json.dumps(uuids)}
         try:
-            logger.info(f"Deleting segment: {segment_uuid}")
-            response = self._request_with_retry("DELETE", url, json=data)
+            response = self._request_with_retry("GET", url, params=params)
             if response.status_code == 200:
-                logger.info("Segment deleted successfully!")
-                return True
-            else:
-                logger.error(f"Failed to delete segment: {response.status_code} - {response.text}")
-                return False
+                data = response.json()
+                return data if isinstance(data, list) else [data]
+            logger.warning(f"segmentInfo returned {response.status_code}: {response.text[:200]}")
+            return []
         except requests.RequestException as e:
-            logger.error(f"API request failed after retries: {e}")
+            logger.error(f"segmentInfo request failed: {e}")
+            return []
+
+    def is_own_segment(self, segment_info: dict) -> bool:
+        """True if the segment was submitted by our current userID."""
+        return segment_info.get("userID") == self.get_public_user_id()
+
+    # Vote types for vote_segment()
+    VOTE_DOWN = 0
+    VOTE_UP = 1
+    VOTE_UNDO = 20
+
+    def vote_segment(self, segment_uuid: str, vote_type: int = VOTE_DOWN) -> bool:
+        """
+        Vote on a segment via /voteOnSponsorTime.
+        Downvoting (type=0) a segment WE submitted removes it entirely.
+        Downvoting someone else's segment only counts as a normal downvote.
+        """
+        url = f"{self.base_url}/voteOnSponsorTime"
+        params = {"UUID": segment_uuid, "userID": self.user_id, "type": vote_type}
+        try:
+            logger.info(f"Voting (type={vote_type}) on segment {segment_uuid}")
+            response = self._request_with_retry("POST", url, params=params)
+            if response.status_code == 200:
+                return True
+            logger.error(f"Vote failed: {response.status_code} - {response.text[:200]}")
             return False
+        except requests.RequestException as e:
+            logger.error(f"Vote request failed: {e}")
+            return False
+
+    def delete_segment(self, segment_uuid: str) -> bool:
+        """
+        Remove a segment we submitted. SponsorBlock has no DELETE endpoint;
+        the sanctioned mechanism is the submitter downvoting their own
+        segment, which removes it entirely. Only works for our own segments.
+        """
+        return self.vote_segment(segment_uuid, self.VOTE_DOWN)
