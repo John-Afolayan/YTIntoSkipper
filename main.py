@@ -60,9 +60,8 @@ def url_generator_from_channel(channel_url, cutoff_date=None):
     Yields URLs dynamically from a YouTube channel.
 
     With a cutoff_date, full-metadata mode is used (slower per entry, but
-    includes upload_date), videos uploaded before the cutoff are skipped,
-    and iteration stops early once the feed is clearly past the cutoff
-    (channel feeds stream newest-first).
+    includes upload_date) and every video uploaded before the cutoff is
+    skipped. The whole feed is always walked — no early-stop guessing.
     """
     logger.info(f"Fetching video list from channel: {channel_url}")
     if cutoff_date is None:
@@ -73,24 +72,18 @@ def url_generator_from_channel(channel_url, cutoff_date=None):
                 yield url
         return
 
-    STOP_AFTER_CONSECUTIVE_OLD = 8  # tolerate stray out-of-order entries
-    consecutive_old = 0
+    skipped = 0
     stream = yt_dlp_stream_list(channel_url, fast=False)
     for entry in stream:
         if not filter_entry_by_date(entry, after=cutoff_date, before=None):
-            consecutive_old += 1
+            skipped += 1
             logger.debug(f"Skipping pre-cutoff video: {entry.get('id')}")
-            if consecutive_old >= STOP_AFTER_CONSECUTIVE_OLD:
-                logger.info(
-                    f"{consecutive_old} consecutive videos older than "
-                    f"{cutoff_date} — stopping (rest of the feed predates the cutoff)."
-                )
-                return
             continue
-        consecutive_old = 0
         url = build_watch_url_from_entry(entry)
         if url:
             yield url
+    if skipped:
+        logger.info(f"Cutoff filter: skipped {skipped} video(s) uploaded before {cutoff_date}")
 
 
 def main():

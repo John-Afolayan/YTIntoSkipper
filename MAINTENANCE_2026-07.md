@@ -51,7 +51,7 @@ cutoff_date = 2022-10-01
 
 - Selection: `--channel-name MyChannel`, or automatic when the config has exactly one channel. The section name doubles as the adaptive-learning `channel_id`.
 - Precedence: CLI flag > channel section > defaults > built-in default. A flag only "wins" if you actually typed it.
-- **`cutoff_date`** (your October 2022 case): channel mode switches to full-metadata listing (which includes upload dates), skips videos uploaded before the cutoff, and stops the feed entirely after 8 consecutive pre-cutoff videos (feeds stream newest-first; the tolerance absorbs stray out-of-order entries). It applies to both normal processing and `--reprocess`. It cannot work with `--urls-file` (no dates there) — a warning is printed and it's ignored.
+- **`cutoff_date`** (your October 2022 case): channel mode switches to full-metadata listing (which includes upload dates) and skips every video uploaded before the cutoff — a straight per-video date check over the whole feed, no early-stop guessing. It applies to both normal processing and `--reprocess`. It cannot work with `--urls-file` (no dates there) — a warning is printed and it's ignored.
 
 ## 4. Removing the 8 wrong submissions — done ✅
 
@@ -107,7 +107,7 @@ Heads-up for `KHMA6y0GUw8` specifically: close the browser before a `--cookies-f
 
 - All modules compile; the 16 detection unit tests pass.
 - The 8 segment removals were executed against the live SponsorBlock API and verified gone by re-query (see §4).
-- Not exercised end-to-end in this round: an age-restricted download retry with real browser cookies (needs your signed-in browser), and a full channel run with `cutoff_date` (needs a long yt-dlp full-metadata listing). Both paths are small deltas over code that already ran; if the cutoff scan misbehaves, the `STOP_AFTER_CONSECUTIVE_OLD = 8` tolerance in `main.py` is the knob to look at.
+- Not exercised end-to-end in this round: an age-restricted download retry with real browser cookies (needs your signed-in browser), and a full channel run with `cutoff_date` (needs a long yt-dlp full-metadata listing). Both paths are small deltas over code that already ran.
 
 ## Files touched
 

@@ -73,7 +73,7 @@ cutoff_date = 2022-10-01    # channel didn't use intros before this — skip old
 
 - Select a channel section with `--channel-name MyChannel`; if the config has exactly one channel it's picked automatically. The section name doubles as `channel_id` for adaptive learning.
 - Precedence: **CLI flag > `[channels.X]` > `[defaults]` > built-in default** — flags you actually type always win.
-- `cutoff_date` only applies in channel mode (URL files carry no upload dates). The channel feed is scanned newest-first and stops once it's clearly past the cutoff.
+- `cutoff_date` only applies in channel mode (URL files carry no upload dates). Every video's upload date is checked against the cutoff and pre-cutoff videos are skipped.
 
 With a config in place, runs shrink to:
 ```bash
