@@ -16,11 +16,13 @@ if not _env_loaded:
     print(f"Note: No .env file found (searched {_env_path} and cwd={os.getcwd()})",
           file=sys.stderr)
 
-from automator import IntroSkipperAutomator
+# NOTE: automator (scipy/librosa/numpy) is imported lazily inside main() so
+# admin commands (--remove-intros, --list-segments, --db-stats, ...) work
+# without the heavy audio stack installed.
 from sponsorblock_api import SponsorBlockAPI
 from logger import logger
 
-from populate_urls import yt_dlp_stream_list, build_watch_url_from_entry
+from populate_urls import yt_dlp_stream_list, build_watch_url_from_entry, filter_entry_by_date
 
 
 def _extract_channel_id_from_url(url: str) -> str:
@@ -53,11 +55,39 @@ def url_generator_from_file(filepath):
             yield line
 
 
-def url_generator_from_channel(channel_url):
-    """Yields URLs dynamically from a YouTube channel."""
+def url_generator_from_channel(channel_url, cutoff_date=None):
+    """
+    Yields URLs dynamically from a YouTube channel.
+
+    With a cutoff_date, full-metadata mode is used (slower per entry, but
+    includes upload_date), videos uploaded before the cutoff are skipped,
+    and iteration stops early once the feed is clearly past the cutoff
+    (channel feeds stream newest-first).
+    """
     logger.info(f"Fetching video list from channel: {channel_url}")
-    stream = yt_dlp_stream_list(channel_url, fast=True)
+    if cutoff_date is None:
+        stream = yt_dlp_stream_list(channel_url, fast=True)
+        for entry in stream:
+            url = build_watch_url_from_entry(entry)
+            if url:
+                yield url
+        return
+
+    STOP_AFTER_CONSECUTIVE_OLD = 8  # tolerate stray out-of-order entries
+    consecutive_old = 0
+    stream = yt_dlp_stream_list(channel_url, fast=False)
     for entry in stream:
+        if not filter_entry_by_date(entry, after=cutoff_date, before=None):
+            consecutive_old += 1
+            logger.debug(f"Skipping pre-cutoff video: {entry.get('id')}")
+            if consecutive_old >= STOP_AFTER_CONSECUTIVE_OLD:
+                logger.info(
+                    f"{consecutive_old} consecutive videos older than "
+                    f"{cutoff_date} — stopping (rest of the feed predates the cutoff)."
+                )
+                return
+            continue
+        consecutive_old = 0
         url = build_watch_url_from_entry(entry)
         if url:
             yield url
@@ -67,6 +97,13 @@ def main():
     parser = argparse.ArgumentParser(
         description="Automated YouTube intro detection and SponsorBlock submission",
     )
+
+    # --- Config file ---
+    parser.add_argument("--config", default=None,
+                        help="TOML config file (default: config.toml next to the script, if present)")
+    parser.add_argument("--channel-name", default=None,
+                        help="Which [channels.X] section of the config to use "
+                             "(auto-selected when the config has exactly one channel)")
 
     # --- Input ---
     parser.add_argument(
@@ -82,6 +119,9 @@ def main():
     # --- Behaviour ---
     parser.add_argument("--intro-duration", type=float, default=None,
                         help="Override intro duration in seconds (default: auto-detect from reference)")
+    parser.add_argument("--cutoff-date", default=None,
+                        help="Skip videos uploaded before this date (YYYY-MM-DD). "
+                             "Channel mode only — e.g. the channel didn't use intros before then")
     parser.add_argument("--manual-approval", action="store_true",
                         help="Require manual approval before submitting")
     parser.add_argument("--dry-run", action="store_true",
@@ -117,10 +157,21 @@ def main():
     parser.add_argument("--workers", type=int, default=1,
                         help="Parallel download+analyse workers (default: 1, use 2-4 for speed)")
 
+    # --- Downloads / age-restricted videos ---
+    parser.add_argument("--cookies-file", default=None,
+                        help="Netscape-format cookies file for yt-dlp (needed for age-restricted videos)")
+    parser.add_argument("--cookies-from-browser", default=None,
+                        help="Browser to pull YouTube cookies from (e.g. brave, chrome, firefox). "
+                             "Used as a fallback when a download is age-restricted")
+
     # --- SponsorBlock / Admin ---
     parser.add_argument("--user-id", help="SponsorBlock user ID")
     parser.add_argument("--delete-video", help="Delete intro segments for a specific video ID")
     parser.add_argument("--list-segments", help="List all segments for a video ID")
+    parser.add_argument("--remove-intros", nargs="+", metavar="URL_OR_FILE",
+                        help="Remove OUR intro segments from the given video URLs "
+                             "(or a text file of URLs), and mark the videos as "
+                             "no-intro so they won't be resubmitted")
 
     # --- Channel & Learning ---
     parser.add_argument("--channel-id", help="Channel identifier for per-channel adaptive learning")
@@ -139,6 +190,25 @@ def main():
                         help="Clear only transient error records (so failed videos are retried) and exit")
 
     args = parser.parse_args()
+
+    # --- Config file (CLI flags win over config values) ---
+    from config import (
+        load_config, resolve_channel_settings, apply_settings_to_args,
+        parse_cutoff_date,
+    )
+    try:
+        cfg = load_config(args.config)
+        settings = resolve_channel_settings(cfg, args.channel_name)
+        apply_settings_to_args(args, parser, settings)
+    except (FileNotFoundError, KeyError, ValueError) as e:
+        parser.error(str(e))
+
+    cutoff_date = None
+    if args.cutoff_date:
+        try:
+            cutoff_date = parse_cutoff_date(args.cutoff_date)
+        except ValueError as e:
+            parser.error(str(e))
 
     # --- DB commands ---
     if args.db_stats:
@@ -262,6 +332,17 @@ def main():
         store.close()
         return
 
+    # --- Segment removal (helper for wrongly submitted intros) ---
+    if args.remove_intros:
+        from segment_admin import collect_urls, remove_intro_segments
+        user_id = args.user_id or os.getenv("SPONSORBLOCK_USER_ID")
+        api = SponsorBlockAPI(user_id)
+        urls = collect_urls(args.remove_intros)
+        if not urls:
+            parser.error("--remove-intros: no URLs found in the given arguments")
+        remove_intro_segments(api, urls, db_path=args.db, dry_run=args.dry_run)
+        return
+
     # --- List / Delete commands ---
     if args.list_segments:
         user_id = args.user_id or os.getenv("SPONSORBLOCK_USER_ID")
@@ -292,6 +373,16 @@ def main():
     if not channel_id and args.channel:
         channel_id = _extract_channel_id_from_url(args.channel)
 
+    if cutoff_date and not args.channel:
+        logger.warning(
+            "--cutoff-date only works in channel mode (URL files carry no "
+            "upload dates) — ignoring it."
+        )
+        cutoff_date = None
+    if cutoff_date:
+        logger.info(f"Cutoff date active: skipping videos uploaded before {cutoff_date}")
+
+    from automator import IntroSkipperAutomator
     automator = IntroSkipperAutomator(
         manual_approval=args.manual_approval,
         dry_run=args.dry_run,
@@ -304,6 +395,8 @@ def main():
         workers=args.workers,
         db_path=args.db,
         channel_id=channel_id,
+        cookies_file=args.cookies_file,
+        cookies_from_browser=args.cookies_from_browser,
     )
 
     # Load reference intro(s)
@@ -322,7 +415,7 @@ def main():
     print(f"SPONSORBLOCK_USER_ID = {sb_uid}")
 
     if args.channel:
-        source = url_generator_from_channel(args.channel)
+        source = url_generator_from_channel(args.channel, cutoff_date=cutoff_date)
     else:
         source = url_generator_from_file(args.urls_file)
 

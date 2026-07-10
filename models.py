@@ -14,6 +14,10 @@ class IntroSegment:
     # (while the reference is instrumental there) — submitting this skip
     # would cut the creator's talking, so it must be manually reviewed.
     talkover_warning: bool = False
+    # Hard review requirement. Once set, NOTHING may auto-submit this
+    # segment — not even a positive adaptive confidence adjustment that
+    # would otherwise upgrade the tier back to "high".
+    force_review: bool = False
 
     @property
     def duration(self) -> float:

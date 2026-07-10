@@ -148,9 +148,15 @@ class IntroSkipperAutomator:
         db_path: str = "intro_skipper.db",
         # Channel tracking
         channel_id: str = None,
+        # Cookies for age-restricted videos
+        cookies_file: str = None,
+        cookies_from_browser: str = None,
     ):
         self.fingerprinter = AudioFingerprinter()
-        self.downloader = YouTubeDownloader()
+        self.downloader = YouTubeDownloader(
+            cookies_file=cookies_file,
+            cookies_from_browser=cookies_from_browser,
+        )
         self.sponsorblock = SponsorBlockAPI()
         self.db = VideoDB(db_path)
         self.manual_approval = manual_approval
@@ -440,6 +446,7 @@ class IntroSkipperAutomator:
         talkover = self.fingerprinter.detect_talkover_at_start(
             ref_data, audio_path, start_time,
         )
+        force_review = False
         if talkover:
             logger.warning(
                 f"Speech detected over the start of the matched intro at "
@@ -447,6 +454,9 @@ class IntroSkipperAutomator:
                 f"manual review."
             )
             raw_confidence = min(raw_confidence, self.CONFIDENCE_HIGH - 0.01)
+            # The confidence cap alone is NOT enough: a positive adaptive
+            # adjustment could push the tier back to "high" downstream.
+            force_review = True
 
         # 4. Adaptive Divergence Check
         actual_end_timestamp = self.fingerprinter.detect_audio_divergence(
@@ -489,13 +499,11 @@ class IntroSkipperAutomator:
         if start_time > 0.5:
             start_time = max(0.0, start_time - 0.2)
 
-        # Get full video duration from audio file
-        video_duration = 0.0
-        try:
-            import librosa
-            video_duration = librosa.get_duration(path=audio_path)
-        except Exception:
-            pass
+        # Get full video duration from audio file (soundfile/ffprobe —
+        # librosa.get_duration(path=...) on m4a hits the deprecated
+        # audioread fallback and will break on librosa 1.0)
+        from audio_fingerprint import get_audio_duration
+        video_duration = get_audio_duration(audio_path)
 
         return IntroSegment(
             start_time=start_time,
@@ -503,6 +511,7 @@ class IntroSkipperAutomator:
             confidence=raw_confidence,
             video_duration=video_duration,
             talkover_warning=talkover,
+            force_review=force_review,
         )
 
     # ------------------------------------------------------------------
@@ -544,7 +553,16 @@ class IntroSkipperAutomator:
                     break  # success
                 except RuntimeError as dl_err:
                     err_str = str(dl_err)
-                    # Don't retry on permanent errors (age-restricted, private, etc)
+
+                    # Age-restricted: distinct status, retried automatically
+                    # on future runs once cookies are configured.
+                    if err_str.startswith("age-restricted"):
+                        logger.warning(f"Age-restricted video: {err_str}")
+                        print(f"\n  [AGE-RESTRICTED] {url}\n  {err_str}")
+                        self.db.record(video_id, "error_age_restricted")
+                        return False, "failed", video_id
+
+                    # Don't retry on permanent errors (private, removed, etc)
                     permanent_keywords = [
                         "Sign in to confirm",
                         "Private video",
@@ -607,9 +625,16 @@ class IntroSkipperAutomator:
                         )
                         intro_segment.end_time = correction.corrected_end
 
-                    # Adjust effective confidence for threshold decisions
+                    # Adjust effective confidence for threshold decisions.
+                    # DOWNGRADE ONLY: a positive adjustment (channel
+                    # confidence bias, profile-aligned bonus) must never
+                    # promote a medium detection to "high" — that would
+                    # auto-submit something already flagged for review.
                     effective_confidence = intro_segment.confidence + correction.confidence_adjustment
-                    confidence_tier = self._classify_confidence(effective_confidence)
+                    adjusted_tier = self._classify_confidence(effective_confidence)
+                    tier_rank = {"low": 0, "medium": 1, "high": 2}
+                    if tier_rank[adjusted_tier] < tier_rank[confidence_tier]:
+                        confidence_tier = adjusted_tier
 
                     # Flag deviations for manual review
                     has_deviation = any("deviation" in f for f in correction.flags)
@@ -622,12 +647,31 @@ class IntroSkipperAutomator:
                     self.db.record(video_id, "dry_run", intro_segment.start_time, intro_segment.end_time)
                     return True, "dry_run", video_id
 
-                # Medium confidence: always require manual review regardless
+                # Medium confidence (or a hard force_review flag, e.g. the
+                # talk-over guard): always require manual review regardless
                 # of --manual-approval flag, with a warning.
-                needs_review = self.manual_approval or confidence_tier == "medium"
+                needs_review = (
+                    self.manual_approval
+                    or confidence_tier == "medium"
+                    or intro_segment.force_review
+                )
+
+                # Parallel workers can't prompt (input() from worker threads
+                # is broken/interleaved) — park the video for a sequential
+                # re-run instead of submitting unreviewed.
+                if needs_review and self.workers > 1:
+                    logger.warning(
+                        f"Needs manual review but running with --workers "
+                        f"{self.workers} — parking {video_id} (status "
+                        f"'needs_review'). Re-run sequentially to review it."
+                    )
+                    print(f"\n  [NEEDS REVIEW] Parked for sequential re-run: {url}")
+                    self.db.record(video_id, "needs_review",
+                                   intro_segment.start_time, intro_segment.end_time)
+                    return False, "needs_review", video_id
 
                 if needs_review:
-                    if confidence_tier == "medium":
+                    if confidence_tier == "medium" or intro_segment.force_review:
                         print(f"\n  *** MEDIUM CONFIDENCE ({intro_segment.confidence:.2f}) — please verify ***")
                         logger.warning(
                             f"Medium confidence ({intro_segment.confidence:.2f}) for {url}. "

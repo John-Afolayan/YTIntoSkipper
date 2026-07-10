@@ -16,8 +16,12 @@ PERMANENT_STATUSES = frozenset({
     "rejected",
     "skipped_existing",
     "dry_run",
-    "error_permanent",  # age-restricted, private, removed — will never work
+    "error_permanent",  # private, removed — will never work
 })
+# NOTE: intentionally NOT permanent (retried on later runs):
+#   "needs_review"          — parked during a parallel run; picked up by the
+#                             next sequential run for interactive review.
+#   "error_age_restricted"  — retried automatically once cookies are set up.
 
 
 class VideoDB:

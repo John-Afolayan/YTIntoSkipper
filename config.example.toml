@@ -1,0 +1,45 @@
+# YTIntroSkipper configuration
+#
+# Copy to config.toml (auto-loaded) or pass explicitly: --config myconfig.toml
+# Precedence: CLI flag > [channels.X] > [defaults] > built-in default.
+# Select a channel section with --channel-name; if the config has exactly
+# one channel it is selected automatically.
+
+[defaults]
+# Detection tuning
+peak_height = 0.25
+weighted_threshold = 0.60
+search_limit = 120.0
+early_exit = 0.90
+
+# Behaviour
+manual_approval = false
+trim_speech = false
+clipboard = false
+workers = 1
+
+# Audit (--reprocess) tolerance: propose a correction when start or end
+# differs from the live submission by at least this many seconds
+diff_threshold = 0.5
+
+# Storage
+db = "intro_skipper.db"
+
+# Age-restricted videos (optional): a Netscape-format cookies file, and/or a
+# browser to pull cookies from as a fallback ("brave", "chrome", "firefox", ...)
+# cookies_file = "C:/Users/you/Downloads/cookies.txt"
+# cookies_from_browser = "brave"
+
+[channels.MyChannel]
+channel_url = "https://www.youtube.com/@MyChannel"
+# channel_id defaults to the section name ("MyChannel")
+reference_intros = ["intro.m4a"]
+
+# Don't process videos uploaded before this date (e.g. the channel only
+# started using intros in October 2022). Requires channel mode (--channel /
+# channel_url); URL files carry no upload dates.
+cutoff_date = 2022-10-01
+
+# Any [defaults] key can be overridden per channel:
+# diff_threshold = 0.3
+# trim_speech = true

@@ -17,7 +17,9 @@ import threading
 from datetime import datetime, timezone
 from typing import Iterable, Optional
 
-from automator import _copy_to_clipboard, _url_with_timestamp
+# NOTE: automator helpers (_copy_to_clipboard, _url_with_timestamp) are
+# imported lazily inside methods — importing automator at module level pulls
+# in scipy/librosa, which the lightweight admin path (segment_admin) avoids.
 from logger import logger
 
 try:
@@ -36,6 +38,7 @@ PERMANENT_REPROCESS_STATUSES = frozenset({
     "no_submission",      # video has no intro segment on SponsorBlock
     "no_detection",       # detector found no confident intro to compare
     "locked",             # segment locked by a VIP — cannot be overridden
+    "removed",            # intro removed via --remove-intros (video has none)
 })
 
 
@@ -269,11 +272,13 @@ class IntroReprocessor:
                 return "locked"
 
             if self.clipboard:
+                from automator import _copy_to_clipboard, _url_with_timestamp
                 clip_url = _url_with_timestamp(url, segment.start_time)
                 if _copy_to_clipboard(clip_url):
                     print(f"  (Copied to clipboard: {clip_url})")
 
-            if not self._confirm("  Apply this correction? (y/n): "):
+            choice, override = self._prompt_decision(segment)
+            if choice == "no":
                 self.cache.record(
                     video_id, "denied",
                     old_start=old_seg[0], old_end=old_seg[1],
@@ -281,7 +286,11 @@ class IntroReprocessor:
                 )
                 return "denied"
 
-            # 5. Apply the fix
+            if choice == "override":
+                segment.start_time, segment.end_time = override
+                print(f"  Using your override: {segment.start_time:.2f}s - {segment.end_time:.2f}s")
+
+            # 5. Apply the fix (suggested times, or the user's override)
             return self._apply_correction(video_id, uuid, owned, old_seg, segment, url)
 
         except KeyboardInterrupt:
@@ -368,6 +377,45 @@ class IntroReprocessor:
                 return True
             if r in ("n", "no"):
                 return False
+
+    @staticmethod
+    def _parse_time_input(prompt: str, default: float) -> float:
+        val = input(prompt).strip().lower()
+        if not val:
+            return default
+        clean = "".join(c for c in val if c.isdigit() or c in ".-")
+        try:
+            return float(clean)
+        except ValueError:
+            print(f"    Invalid input '{val}', using {default:.2f}s.")
+            return default
+
+    def _prompt_decision(self, segment):
+        """
+        Ask what to do with a divergent submission.
+        Returns ("yes"|"no"|"override", (start, end) or None).
+        """
+        while True:
+            r = input(
+                "  [y] Apply suggested  [n] Keep current  [o] Override with my own times: "
+            ).strip().lower()
+            if r in ("y", "yes"):
+                return "yes", None
+            if r in ("n", "no"):
+                return "no", None
+            if r in ("o", "override"):
+                start = self._parse_time_input(
+                    f"    My start (Enter for {segment.start_time:.2f}s): ",
+                    segment.start_time,
+                )
+                end = self._parse_time_input(
+                    f"    My end   (Enter for {segment.end_time:.2f}s): ",
+                    segment.end_time,
+                )
+                if end <= start:
+                    print("    End must be after start — try again.")
+                    continue
+                return "override", (start, end)
 
     # ------------------------------------------------------------------
     # Batch

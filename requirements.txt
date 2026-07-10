@@ -2,27 +2,27 @@
 yt-dlp>=2025.10.14
 
 # Audio analysis and manipulation
-pydub>=0.25.1
+# (librosa pulls in its own runtime deps: numba, soxr, audioread, etc.
+#  Only direct imports are pinned here.)
 librosa>=0.10.2
-soundfile>=0.12.1
-soxr>=0.3.2
-audioread>=3.0.1
-numba>=0.60.0
+soundfile>=0.13.0
 scipy>=1.12.0
 numpy>=2.3.0
-imageio-ffmpeg>=0.5.0
+imageio-ffmpeg>=0.5.0  # bundled ffmpeg fallback when none is on PATH
 
 # Voice activity detection
 # webrtcvad-wheels is a drop-in fork of webrtcvad (same `import webrtcvad`)
 # with prebuilt wheels, so it installs on Windows without a C compiler.
 webrtcvad-wheels>=2.0.10
-silero-vad>=5.0.2  # CPU-only version (safe for WSL)
 
 # API and network requests
 requests>=2.32.0
 
 # Progress bars
 tqdm>=4.66.0
+
+# Config file (TOML) — stdlib tomllib exists on 3.11+
+tomli>=2.0.1; python_version < "3.11"
 
 # Miscellaneous
 python-dotenv

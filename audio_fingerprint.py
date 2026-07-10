@@ -36,6 +36,47 @@ def _has_ffmpeg() -> bool:
     return _get_ffmpeg_executable() is not None
 
 
+def get_audio_duration(audio_path: str) -> float:
+    """
+    Duration of an audio file in seconds, without librosa's deprecated
+    audioread fallback (librosa.get_duration(path=...) on m4a/aac emits
+    "PySoundFile failed. Trying audioread instead" and breaks on librosa 1.0).
+
+    Strategy: soundfile for natively supported formats (wav/flac/ogg/mp3),
+    then ffprobe (ships with ffmpeg) for everything else. Returns 0.0 if
+    neither can read the file.
+    """
+    try:
+        import soundfile as sf
+        info = sf.info(audio_path)
+        return float(info.frames) / float(info.samplerate)
+    except Exception:
+        pass
+
+    ffprobe = shutil.which("ffprobe")
+    if not ffprobe:
+        # imageio-ffmpeg only bundles ffmpeg, not ffprobe — try ffmpeg's
+        # sibling in case ffmpeg came from a full install not on PATH.
+        ffmpeg = _get_ffmpeg_executable()
+        if ffmpeg:
+            sibling = Path(ffmpeg).with_name("ffprobe" + Path(ffmpeg).suffix)
+            if sibling.exists():
+                ffprobe = str(sibling)
+    if ffprobe:
+        try:
+            result = subprocess.run(
+                [ffprobe, "-v", "quiet", "-show_entries", "format=duration",
+                 "-of", "default=noprint_wrappers=1:nokey=1", audio_path],
+                capture_output=True, text=True, check=True,
+            )
+            return float(result.stdout.strip())
+        except Exception as e:
+            logger.debug(f"ffprobe duration failed for {audio_path}: {e}")
+
+    logger.warning(f"Could not determine duration of {audio_path}")
+    return 0.0
+
+
 class AudioFingerprinter:
     CACHE_DIR = Path(".fingerprint_cache")
 

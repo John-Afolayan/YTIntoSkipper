@@ -5,6 +5,8 @@
 /downloads
 
 .env
+# Personal config (may contain cookie paths etc.) — config.example.toml is tracked
+config.toml
 *.m4a
 *.mp4
 *.zip

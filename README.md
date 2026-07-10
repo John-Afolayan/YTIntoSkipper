@@ -29,7 +29,9 @@ Automated YouTube intro detection and [SponsorBlock](https://sponsor.ajay.app/) 
 pip install -r requirements.txt
 ```
 
-Key packages: `librosa`, `scipy`, `numpy`, `yt-dlp`, `requests`, `tqdm`, `python-dotenv`
+Key packages: `librosa`, `soundfile`, `scipy`, `numpy`, `yt-dlp`, `requests`, `tqdm`, `python-dotenv`
+
+(`pydub`, `silero-vad`, and the explicit `audioread` pin were removed in July 2026 — none were used. Durations are now read via soundfile/ffprobe instead of librosa's deprecated audioread fallback, so the `PySoundFile failed. Trying audioread instead` warning is gone.)
 
 ## Setup
 
@@ -52,6 +54,32 @@ Key packages: `librosa`, `scipy`, `numpy`, `yt-dlp`, `requests`, `tqdm`, `python
    ```bash
    ffmpeg -i sample_video.mp4 -ss 0 -t 10.4 -vn -ac 1 -ar 22050 intro.m4a
    ```
+
+## Configuration File
+
+All tunables can live in a TOML config with per-channel sections instead of CLI flags. Copy `config.example.toml` to `config.toml` (auto-loaded) or pass `--config myconfig.toml`:
+
+```toml
+[defaults]
+diff_threshold = 0.5        # audit tolerance
+trim_speech = true
+# cookies_from_browser = "brave"   # for age-restricted videos
+
+[channels.MyChannel]
+channel_url = "https://www.youtube.com/@MyChannel"
+reference_intros = ["intro.m4a"]
+cutoff_date = 2022-10-01    # channel didn't use intros before this — skip older videos
+```
+
+- Select a channel section with `--channel-name MyChannel`; if the config has exactly one channel it's picked automatically. The section name doubles as `channel_id` for adaptive learning.
+- Precedence: **CLI flag > `[channels.X]` > `[defaults]` > built-in default** — flags you actually type always win.
+- `cutoff_date` only applies in channel mode (URL files carry no upload dates). The channel feed is scanned newest-first and stops once it's clearly past the cutoff.
+
+With a config in place, runs shrink to:
+```bash
+python main.py --channel-name MyChannel                # normal processing
+python main.py --channel-name MyChannel --reprocess    # audit existing submissions
+```
 
 ## Usage
 
@@ -101,6 +129,30 @@ Speed up batch runs with multiple workers (max 5 to avoid rate-limiting):
 python main.py --reference-intro intro.m4a --urls-file urls.txt --workers 3
 ```
 
+Parallel workers can't prompt for input, so any video that needs manual review (medium confidence, talk-over warning) is **parked** with status `needs_review` instead of being submitted. Re-run sequentially (no `--workers`) to review the parked videos interactively.
+
+### Removing Wrong Submissions
+
+If intros were submitted for videos that don't have one, remove them (accepts URLs and/or text files of URLs, mixed):
+
+```bash
+python main.py --remove-intros https://www.youtube.com/watch?v=XXXX bad_urls.txt
+python main.py --remove-intros bad_urls.txt --dry-run   # preview only
+```
+
+Segments submitted by our userID are removed outright (self-downvote); foreign segments can only be downvoted and are listed for manual escalation. Each cleaned video is marked `no_intro` locally so neither the pipeline nor the audit resubmits it.
+
+### Age-Restricted Videos
+
+Some videos require sign-in. Two options (config keys `cookies_file` / `cookies_from_browser`, or CLI flags):
+
+```bash
+python main.py ... --cookies-from-browser brave        # pull cookies from your browser on demand
+python main.py ... --cookies-file cookies.txt          # or a Netscape-format export
+```
+
+Browser cookies are only used as a **retry** after a download fails with an age gate, so normal bulk downloads stay anonymous. Age-gated failures get the status `error_age_restricted` and are retried automatically on later runs once cookies are configured.
+
 ### Dry Run
 
 Detect intros without submitting to SponsorBlock:
@@ -121,7 +173,7 @@ python main.py --reprocess --ignore-cache --reference-intro intro.m4a --channel 
 ```
 
 - Submissions within `--diff-threshold` seconds (default 0.5) of the suggestion are recorded as OK and skipped; small jitter (±0.05s) is never flagged.
-- Divergent videos show a side-by-side comparison and wait for `y`/`n` approval before anything is changed.
+- Divergent videos show a side-by-side comparison and wait for your decision: `[y]` apply the suggestion, `[n]` keep the current submission, or `[o]` **override** — type your own start/end times and those are submitted instead.
 - Approved corrections on **our own** segments are removed and resubmitted. Segments submitted by **other userIDs** (e.g. old random one-time IDs) cannot be removed — they are downvoted and the correction is submitted alongside, then listed for manual attention at the end of the run.
 - The audit cache is a separate table from the main pipeline's dedup DB; `--reprocess-stats` shows its contents.
 - `--dry-run` and `--clipboard` also work in audit mode.
@@ -130,6 +182,13 @@ See [REPROCESSING.md](REPROCESSING.md) for the full design, the SponsorBlock own
 
 ## CLI Reference
 
+### Config
+
+| Flag | Description |
+|------|-------------|
+| `--config PATH` | TOML config file (default: `config.toml` next to the script, if present) |
+| `--channel-name NAME` | Which `[channels.X]` config section to use |
+
 ### Input Options
 
 | Flag | Description |
@@ -137,6 +196,7 @@ See [REPROCESSING.md](REPROCESSING.md) for the full design, the SponsorBlock own
 | `--reference-intro PATH` | Path to reference intro audio (can specify multiple times) |
 | `--urls-file PATH` | Text file with one YouTube URL per line |
 | `--channel URL` | YouTube channel URL (processes all videos) |
+| `--cutoff-date DATE` | Skip videos uploaded before this date (channel mode only) |
 
 ### Behaviour
 
@@ -196,7 +256,10 @@ See [REPROCESSING.md](REPROCESSING.md) for the full design, the SponsorBlock own
 |------|-------------|
 | `--user-id UUID` | Override SponsorBlock user ID |
 | `--list-segments VIDEO_ID` | List all intro segments for a video |
+| `--remove-intros URL_OR_FILE ...` | Remove our intro segments from videos (URLs and/or files of URLs; `--dry-run` to preview) |
 | `--delete-video VIDEO_ID` | Delete intro segments for a video (not yet implemented) |
+| `--cookies-file PATH` | Netscape-format cookies file for yt-dlp |
+| `--cookies-from-browser NAME` | Browser to pull cookies from on age-restricted retries |
 
 Note: SponsorBlock only lets a segment be removed by the userID that submitted it. Segments submitted under other (e.g. one-time random) IDs can only be downvoted and out-competed — see [REPROCESSING.md](REPROCESSING.md).
 
@@ -264,8 +327,11 @@ Environment variables (`CHANNEL_URL`, `DATE_FROM`, `DATE_TO`) can also be set in
 ├── automator.py            # Core orchestration (detection + submission pipeline)
 ├── audio_fingerprint.py    # Chroma fingerprinting, cross-correlation, verification, speech detection
 ├── detection_utils.py      # Candidate selection + verification arbitration (pure logic, unit-tested)
+├── config.py               # TOML config loading (per-channel sections)
+├── config.example.toml     # Config template — copy to config.toml
 ├── sponsorblock_api.py     # SponsorBlock API client with retry logic
 ├── reprocessor.py          # Audit mode: re-check + fix existing submissions (own cache)
+├── segment_admin.py        # --remove-intros helper (wrong-submission cleanup)
 ├── youtube_downloader.py   # yt-dlp wrapper for audio downloading
 ├── video_db.py             # SQLite tracker for processed videos (deduplication)
 ├── feedback_store.py       # Feedback and channel profile storage

@@ -20,7 +20,7 @@ Per video the flow is:
 2. **Fetch the live submission** — the video's current intro segment(s) from SponsorBlock. Videos with no intro submission are recorded as `no_submission` and skipped (nothing to audit — the normal pipeline handles those).
 3. **Re-analyze** — the audio is downloaded and run through the current detector (same references, same verification/arbitration logic as the main pipeline).
 4. **Compare** — if both `|Δstart|` and `|Δend|` are under the threshold (default **0.5s**, tune with `--diff-threshold`), the submission is fine → recorded as `ok`, move on. Sub-tolerance jitter (±0.05s etc.) is deliberately ignored.
-5. **Propose** — divergent videos print a comparison and wait for `y`/`yes` or `n`/`no`:
+5. **Propose** — divergent videos print a comparison and wait for a decision: `[y]` apply the suggestion, `[n]` keep the current submission, or `[o]` override — enter your own start/end times (e.g. keep the detected start but end at `16.00s`) and those are submitted instead of the suggestion:
 
    ```
    ================================================================
@@ -78,7 +78,7 @@ This situation exists because some submissions were made with random one-time ID
 
 A new table `reprocessed_videos` (same SQLite file, `--db`) stores one row per audited video: status, the old segment, the suggested segment, and a timestamp.
 
-- **Permanent statuses** (skipped on future runs): `ok`, `corrected`, `corrected_unowned`, `denied`, `no_submission`, `no_detection`, `locked`.
+- **Permanent statuses** (skipped on future runs): `ok`, `corrected`, `corrected_unowned`, `denied`, `no_submission`, `no_detection`, `locked`, `removed` (cleaned via `--remove-intros`).
 - **Transient statuses** (`error_*` — download/API failures): retried automatically on the next run.
 - `--ignore-cache` re-audits everything regardless (results still update the cache).
 - `--reprocess-stats` prints a status breakdown of the cache.
