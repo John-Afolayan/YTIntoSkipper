@@ -8,11 +8,11 @@ from typing import Tuple, Optional, Iterable, List
 
 from sponsorblock_api import SponsorBlockAPI
 from youtube_downloader import YouTubeDownloader
-from audio_fingerprint import AudioFingerprinter
+from audio_fingerprint import AudioFingerprinter, AudioAnalysisError
 from video_db import VideoDB
 from feedback_store import FeedbackStore, REASON_CATEGORIES, REASON_LABELS
 from adaptive_engine import AdaptiveEngine
-from detection_utils import select_start_candidate, resolve_ambiguity
+from detection_utils import select_start_candidate
 from models import IntroSegment
 from logger import logger
 
@@ -190,6 +190,7 @@ class IntroSkipperAutomator:
     def set_reference_intro(self, audio_path: str, duration: float = None):
         """Load a single reference intro (backward-compatible)."""
         self._references.clear()
+        self.intro_duration = 0.0
         self.add_reference_intro(audio_path, duration)
 
     def add_reference_intro(self, audio_path: str, duration: float = None):
@@ -274,6 +275,9 @@ class IntroSkipperAutomator:
         if scores is None or len(scores) == 0:
             return None
 
+        if not np.isfinite(scores).all():
+            raise AudioAnalysisError("Scan produced non-finite correlation scores")
+
         # 2. Peaks
         #    `distance` is measured in CHROMA FRAMES (hop_length samples
         #    each), not audio samples. Require ~2 seconds between peaks:
@@ -282,8 +286,10 @@ class IntroSkipperAutomator:
         #    single peak — delayed intros never even became candidates.)
         min_peak_distance = max(1, int(2.0 * sr / hop_length))
         peaks, _ = find_peaks(scores, height=self.peak_height, distance=min_peak_distance)
-        if len(peaks) == 0:
-            return None
+        # scipy excludes both endpoints, even when either is the only match.
+        endpoints = [p for p in {0, len(scores) - 1}
+                     if np.isfinite(scores[p]) and scores[p] >= self.peak_height]
+        peaks = sorted(set(peaks) | set(endpoints))
 
         time_per_frame = hop_length / sr
         candidates = []
@@ -292,8 +298,6 @@ class IntroSkipperAutomator:
         for p in peaks:
             time_sec = p * time_per_frame
             raw_score = scores[p]
-            if time_sec < 1.5:
-                time_sec = 0.0
 
             weighted_score = raw_score + self._position_weight(time_sec)
             candidates.append({
@@ -303,35 +307,16 @@ class IntroSkipperAutomator:
                 "frame": p,
             })
 
-        # 3b. Always consider position 0 as a candidate.
-        #     find_peaks() can miss the very first frame if the correlation
-        #     doesn't have a local valley before it.  If position 0 has a
-        #     strong score and no existing candidate covers it, inject it.
-        score_at_zero = float(scores[0]) if len(scores) > 0 else 0.0
-        has_zero_candidate = any(c["time"] == 0.0 for c in candidates)
-        if not has_zero_candidate and score_at_zero >= self.peak_height:
-            weighted_zero = score_at_zero + self._position_weight(0.0)
-            candidates.append({
-                "time": 0.0,
-                "raw": score_at_zero,
-                "weighted": weighted_zero,
-                "frame": 0,
-            })
-            logger.debug(
-                f"Injected position-0 candidate (Raw: {score_at_zero:.3f}, "
-                f"Weighted: {weighted_zero:.3f}) — missed by find_peaks"
-            )
+        score_at_zero = float(scores[0])
 
         candidates.sort(key=lambda x: x["weighted"], reverse=True)
 
-        # Verification callback: measures how well the reference ACTUALLY
-        # matches the video at a given start (frame-wise cosine coverage).
-        # Cached per position — arbitration and ambiguity resolution may ask
-        # about the same timestamp.
+        # Verify each position with spectral shape and temporal structure.
+        # Cache evidence so selection and confidence use identical results.
         verify_cache: dict = {}
 
         def _verify(start_time: float):
-            key = round(start_time, 2)
+            key = start_time
             if key not in verify_cache:
                 result = self.fingerprinter.verify_match_quality(
                     ref_data, audio_path, start_time,
@@ -340,7 +325,10 @@ class IntroSkipperAutomator:
                     logger.info(
                         f"  Verify @ {start_time:.2f}s: "
                         f"coverage={result['coverage']:.2f}, "
-                        f"mean_sim={result['mean_similarity']:.2f}"
+                        f"mean_sim={result['mean_similarity']:.2f}, "
+                        f"spectral={result['spectral_coverage']:.2f}, "
+                        f"temporal={result['temporal_similarity']:.2f}, "
+                        f"verified={result['verified']}"
                     )
                 verify_cache[key] = result
             return verify_cache[key]
@@ -363,51 +351,6 @@ class IntroSkipperAutomator:
             )
         if best is None:
             return None
-
-        # 5. Ambiguity detection
-        #    If the best match is late (>15s) AND position 0 scores almost as
-        #    high in *raw* correlation, the fingerprint matches at both places.
-        #    This means the intro music is overlaid at 0s — we can't reliably
-        #    determine the correct boundaries, so skip for manual review.
-        #
-        #    We use a RATIO check: position-0 must be within 85% of the best
-        #    raw score AND itself be quite strong (>= 0.60) to be considered
-        #    a competing match.  This avoids false-flagging cases like
-        #    Ibd05fyzKQc where best=0.986 and zero=0.805 (ratio=0.82 — well
-        #    below 0.90, so clearly not ambiguous).
-        AMBIGUITY_WINDOW = 15.0
-        AMBIGUITY_ZERO_MIN = 0.60       # position 0 must be at least this strong
-        AMBIGUITY_RATIO_THRESHOLD = 0.90 # zero must be >= 90% of best raw score
-
-        if best["time"] > AMBIGUITY_WINDOW and score_at_zero >= AMBIGUITY_ZERO_MIN:
-            ratio = score_at_zero / best["raw"] if best["raw"] > 0 else 0.0
-            if ratio >= AMBIGUITY_RATIO_THRESHOLD:
-                logger.warning(
-                    f"AMBIGUOUS: best match at {best['time']:.2f}s (Raw: {best['raw']:.3f}) "
-                    f"but position 0 also scores {score_at_zero:.3f} "
-                    f"(ratio: {ratio:.2f} >= {AMBIGUITY_RATIO_THRESHOLD}). "
-                    f"Verifying both positions against the reference..."
-                )
-                decision = resolve_ambiguity(best["time"], 0.0, _verify, logger=logger)
-                if decision == "zero":
-                    zero_pool = [c for c in candidates if c["time"] == 0.0]
-                    best = max(zero_pool, key=lambda c: c["raw"], default=None) or {
-                        "time": 0.0,
-                        "raw": score_at_zero,
-                        "weighted": score_at_zero + self._position_weight(0.0),
-                        "frame": 0,
-                    }
-                elif decision != "best":
-                    logger.warning(
-                        "Still ambiguous after verification. Skipping for manual review."
-                    )
-                    return None
-            else:
-                logger.info(
-                    f"Position 0 scores {score_at_zero:.3f} vs best {best['raw']:.3f} "
-                    f"(ratio: {ratio:.2f} < {AMBIGUITY_RATIO_THRESHOLD}). "
-                    f"Difference is significant — proceeding with best match."
-                )
 
         if len(self._references) > 1:
             logger.info(
@@ -435,7 +378,7 @@ class IntroSkipperAutomator:
             return None
 
         start_time = best["time"]
-        raw_confidence = best["raw"]
+        raw_confidence = min(float(best["raw"]), _verify(start_time)["quality"])
         intro_dur = ref_data["duration"]
         end_time = start_time + intro_dur
 
@@ -446,7 +389,7 @@ class IntroSkipperAutomator:
         talkover = self.fingerprinter.detect_talkover_at_start(
             ref_data, audio_path, start_time,
         )
-        force_review = False
+        force_review = raw_confidence < self.CONFIDENCE_HIGH
         if talkover:
             logger.warning(
                 f"Speech detected over the start of the matched intro at "
@@ -465,7 +408,7 @@ class IntroSkipperAutomator:
 
         if actual_end_timestamp:
             proposed_duration = actual_end_timestamp - start_time
-            if proposed_duration < self.MIN_INTRO_DURATION:
+            if proposed_duration - 0.1 < self.MIN_INTRO_DURATION:
                 logger.warning(
                     f"Divergence at {actual_end_timestamp:.2f}s too short "
                     f"({proposed_duration:.2f}s). Keeping original end: {end_time:.2f}s"
@@ -505,6 +448,11 @@ class IntroSkipperAutomator:
         from audio_fingerprint import get_audio_duration
         video_duration = get_audio_duration(audio_path)
 
+        if video_duration > 0:
+            end_time = min(end_time, video_duration)
+        if end_time - start_time < self.MIN_INTRO_DURATION:
+            return None
+
         return IntroSegment(
             start_time=start_time,
             end_time=end_time,
@@ -521,6 +469,10 @@ class IntroSkipperAutomator:
         self, url: str, skip_if_exists: bool = True,
     ) -> Tuple[bool, str, str]:
         import time as _time
+
+        def _record(*args, **kwargs):
+            if not self.dry_run:
+                self.db.record(*args, **kwargs)
 
         audio_path = None
         video_id = "unknown"
@@ -541,7 +493,7 @@ class IntroSkipperAutomator:
                 existing = self.sponsorblock.get_segments(video_id)
                 if any(s.get("category") == "intro" for s in existing):
                     logger.info("Skipping (already has intro on SponsorBlock)")
-                    self.db.record(video_id, "skipped_existing")
+                    _record(video_id, "skipped_existing")
                     return True, "skipped", video_id
 
             # Download with retry + backoff (YouTube rate-limits are transient)
@@ -559,7 +511,7 @@ class IntroSkipperAutomator:
                     if err_str.startswith("age-restricted"):
                         logger.warning(f"Age-restricted video: {err_str}")
                         print(f"\n  [AGE-RESTRICTED] {url}\n  {err_str}")
-                        self.db.record(video_id, "error_age_restricted")
+                        _record(video_id, "error_age_restricted")
                         return False, "failed", video_id
 
                     # Don't retry on permanent errors (private, removed, etc)
@@ -571,7 +523,7 @@ class IntroSkipperAutomator:
                     ]
                     if any(kw in err_str for kw in permanent_keywords):
                         logger.warning(f"Permanent download failure: {err_str}")
-                        self.db.record(video_id, "error_permanent")
+                        _record(video_id, "error_permanent")
                         return False, "failed", video_id
 
                     if attempt < download_retries - 1:
@@ -583,7 +535,7 @@ class IntroSkipperAutomator:
                         _time.sleep(wait)
                     else:
                         logger.error(f"Download failed after {download_retries} attempts: {err_str}")
-                        self.db.record(video_id, "error_download")
+                        _record(video_id, "error_download")
                         return False, "failed", video_id
 
             intro_segment = self.find_intro_in_video(audio_path)
@@ -603,7 +555,7 @@ class IntroSkipperAutomator:
                             f"Adaptive rejection ({correction.reject_reason}): {url}"
                         )
                         print(f"\n  [ADAPTIVE SKIP] {correction.reject_reason}: {url}")
-                        self.db.record(video_id, "adaptive_rejected")
+                        _record(video_id, "adaptive_rejected")
                         return False, "failed", video_id
 
                     if correction.flags:
@@ -617,12 +569,14 @@ class IntroSkipperAutomator:
                             f"Start adjusted: {intro_segment.start_time:.2f}s -> "
                             f"{correction.corrected_start:.2f}s"
                         )
+                        intro_segment.force_review = True
                         intro_segment.start_time = correction.corrected_start
                     if correction.corrected_end != intro_segment.end_time:
                         logger.info(
                             f"End adjusted: {intro_segment.end_time:.2f}s -> "
                             f"{correction.corrected_end:.2f}s"
                         )
+                        intro_segment.force_review = True
                         intro_segment.end_time = correction.corrected_end
 
                     # Adjust effective confidence for threshold decisions.
@@ -642,9 +596,18 @@ class IntroSkipperAutomator:
                         confidence_tier = "medium"
                         logger.info("Deviation detected — downgrading to medium confidence for review")
 
+                if (not math.isfinite(intro_segment.start_time)
+                        or not math.isfinite(intro_segment.end_time)
+                        or intro_segment.start_time < 0
+                        or intro_segment.duration < self.MIN_INTRO_DURATION
+                        or (intro_segment.video_duration > 0
+                            and intro_segment.end_time > intro_segment.video_duration)):
+                    logger.warning("Invalid detection boundaries; skipping submission.")
+                    _record(video_id, "needs_review")
+                    return False, "needs_review", video_id
+
                 if self.dry_run:
                     self._print_manual_prompt(url, video_id, intro_segment, dry_run=True)
-                    self.db.record(video_id, "dry_run", intro_segment.start_time, intro_segment.end_time)
                     return True, "dry_run", video_id
 
                 # Medium confidence (or a hard force_review flag, e.g. the
@@ -652,7 +615,7 @@ class IntroSkipperAutomator:
                 # of --manual-approval flag, with a warning.
                 needs_review = (
                     self.manual_approval
-                    or confidence_tier == "medium"
+                    or confidence_tier != "high"
                     or intro_segment.force_review
                 )
 
@@ -666,17 +629,14 @@ class IntroSkipperAutomator:
                         f"'needs_review'). Re-run sequentially to review it."
                     )
                     print(f"\n  [NEEDS REVIEW] Parked for sequential re-run: {url}")
-                    self.db.record(video_id, "needs_review",
+                    _record(video_id, "needs_review",
                                    intro_segment.start_time, intro_segment.end_time)
                     return False, "needs_review", video_id
 
                 if needs_review:
-                    if confidence_tier == "medium" or intro_segment.force_review:
-                        print(f"\n  *** MEDIUM CONFIDENCE ({intro_segment.confidence:.2f}) — please verify ***")
-                        logger.warning(
-                            f"Medium confidence ({intro_segment.confidence:.2f}) for {url}. "
-                            f"Forcing manual review."
-                        )
+                    if confidence_tier != "high" or intro_segment.force_review:
+                        print(f"\n  *** REVIEW REQUIRED (confidence {intro_segment.confidence:.2f}) ***")
+                        logger.warning(f"Audio evidence or boundary changes require review: {url}")
                     self._print_manual_prompt(url, video_id, intro_segment)
                     # Build URL with timestamp so the user can jump right to the intro
                     clipboard_url = _url_with_timestamp(url, intro_segment.start_time)
@@ -706,32 +666,36 @@ class IntroSkipperAutomator:
                     video_duration=intro_segment.video_duration
                 )
                 if success:
-                    self.db.record(video_id, "success", intro_segment.start_time, intro_segment.end_time)
+                    _record(video_id, "success", intro_segment.start_time, intro_segment.end_time)
                     # Periodic recalibration
                     if self.channel_id:
                         self.adaptive_engine.maybe_recalculate(self.channel_id)
                     return True, "success", video_id
                 else:
                     # API failure is transient — don't record permanently
-                    self.db.record(video_id, "error_api", intro_segment.start_time, intro_segment.end_time)
+                    _record(video_id, "error_api", intro_segment.start_time, intro_segment.end_time)
                     return False, "failed", video_id
             else:
-                logger.info(f"No intro found (or ambiguous). Manual review needed: {url}")
+                logger.info(f"No independently verified intro found: {url}")
                 print(f"\n  [SKIPPED] No confident intro detected: {url}")
-                self.db.record(video_id, "no_intro")
-                return False, "failed", video_id
+                _record(video_id, "no_intro")
+                return True, "no_intro", video_id
 
+        except AudioAnalysisError as e:
+            logger.error(f"Audio analysis failed: {e}")
+            _record(video_id, "error_analysis")
+            return False, "failed", video_id
         except RuntimeError as e:
             # Download failures — transient, will be retried
             err_msg = str(e)
             logger.error(f"Download error: {err_msg}")
-            self.db.record(video_id, "error_download")
+            _record(video_id, "error_download")
             return False, "failed", video_id
         except Exception as e:
             err_msg = str(e)
             logger.error(f"Process error: {err_msg}")
             # Use error_* prefix so DB treats it as transient (retryable)
-            self.db.record(video_id, f"error_process")
+            _record(video_id, f"error_process")
             return False, "failed", video_id
         finally:
             if audio_path and os.path.exists(audio_path):
@@ -808,6 +772,12 @@ class IntroSkipperAutomator:
                 new_start = _parse_time(f"  Correct start (Enter for {segment.start_time:.2f}s): ", segment.start_time)
                 new_end = _parse_time(f"  Correct end   (Enter for {segment.end_time:.2f}s): ", segment.end_time)
                 
+                if (not math.isfinite(new_start) or not math.isfinite(new_end)
+                        or new_start < 0 or new_end - new_start < self.MIN_INTRO_DURATION
+                        or (segment.video_duration > 0 and new_end > segment.video_duration)):
+                    print("    Invalid segment boundaries; try again.")
+                    continue
+                detected_start, detected_end = segment.start_time, segment.end_time
                 # Update the segment object so the caller submits the new times
                 segment.start_time = new_start
                 segment.end_time = new_end
@@ -817,8 +787,8 @@ class IntroSkipperAutomator:
                         video_id=video_id,
                         action="approved", # It's still an approval, just corrected
                         channel_id=self.channel_id,
-                        detected_start=segment.start_time,
-                        detected_end=segment.end_time,
+                        detected_start=detected_start,
+                        detected_end=detected_end,
                         correct_start=new_start,
                         correct_end=new_end,
                         raw_confidence=segment.confidence,
@@ -891,7 +861,8 @@ class IntroSkipperAutomator:
 
         logger.info(
             f"Done. Success:{results['success']}  Failed:{results['failed']}  "
-            f"Skipped:{results['skipped']}  DryRun:{results['dry_run']}"
+            f"Skipped:{results['skipped']}  DryRun:{results['dry_run']}  "
+            f"NoIntro:{results.get('no_intro', 0)}  NeedsReview:{results.get('needs_review', 0)}"
         )
 
     def _process_sequential(self, urls, results, total):

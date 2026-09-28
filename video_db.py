@@ -15,10 +15,11 @@ PERMANENT_STATUSES = frozenset({
     "no_intro",
     "rejected",
     "skipped_existing",
-    "dry_run",
     "error_permanent",  # private, removed — will never work
 })
 # NOTE: intentionally NOT permanent (retried on later runs):
+#   "dry_run"               - legacy preview records never block real runs.
+#   "error_analysis"        - decoding/verification failures are retryable.
 #   "needs_review"          — parked during a parallel run; picked up by the
 #                             next sequential run for interactive review.
 #   "error_age_restricted"  — retried automatically once cookies are set up.

@@ -144,7 +144,7 @@ def main():
     parser.add_argument("--search-limit", type=float, default=120.0,
                         help="How many seconds of each video to scan (default: 120)")
     parser.add_argument("--early-exit", type=float, default=0.90,
-                        help="Score above which to stop scanning early (default: 0.90)")
+                        help="Compatibility option; full-window scanning and verification always run")
 
     # --- Performance ---
     parser.add_argument("--workers", type=int, default=1,

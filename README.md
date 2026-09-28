@@ -4,12 +4,12 @@ Automated YouTube intro detection and [SponsorBlock](https://sponsor.ajay.app/) 
 
 ## How It Works
 
-1. **Reference fingerprinting** — You provide one or more audio files of the channel's intro music. The tool generates a chroma-based fingerprint for each (plus a speech-band energy envelope used for speech detection).
-2. **Video scanning** — For each target video, the tool downloads the first N seconds of audio (default: 120s) and runs normalized cross-correlation against the reference fingerprint(s).
-3. **Candidate ranking** — Correlation peaks are scored with position weighting (earlier matches score higher). When a position-0 candidate and a strong delayed candidate compete, **match verification** (frame-wise cosine similarity over the full intro duration) arbitrates — so delayed intros (e.g. an intro starting 60s in) are no longer misattributed to 0:00. Ambiguity between overlapping intro music at 0s and a late match is also resolved by verification where the evidence is decisive.
+1. **Reference fingerprinting** - Provide one or more audio files of the channel's intro music. Each fingerprint includes chroma, a log mel spectrum, and a speech-band energy envelope. Cached fingerprints are versioned and include the sample rate.
+2. **Video scanning** - The tool downloads the video's audio, decodes the first N seconds (default: 120s), and uses chroma cross-correlation to locate possible matches. The complete intro must fit inside the search window. Both endpoints are considered.
+3. **Candidate verification** - Every plausible candidate must match the reference's spectral shape and changes over time, with agreement sustained across the intro. A high chroma score alone cannot produce a detection. Strong verified repeats prefer the first occurrence; a weak opening cannot beat a strong delayed match through position weighting. Measured start times are preserved, with the requested 0.2s pre-buffer for intros starting after 0.5s.
 4. **Talk-over guard** — If the creator is speaking over the head of the matched intro (while the reference is instrumental there), the detection is capped at medium confidence and forced into manual review so the skip can't cut the talking.
 5. **Boundary refinement** — Adaptive divergence detection trims the end point by comparing frame-by-frame cosine similarity between the reference and video. Optional speech-overlay detection (`--trim-speech`) finds energy in the intro tail that the reference doesn't account for, then confirms it is actual speech (webrtcvad, or a syllabic-modulation fallback) before trimming — sound effects and bass drops no longer trigger trims.
-6. **Adaptive learning** — When `--channel-id` is provided, the system records feedback from approvals and denials, builds per-channel profiles, and applies statistical corrections to improve future accuracy over time.
+6. **Adaptive learning** - Channel profiles use approval/correction feedback to propose bounded timestamp adjustments. Changed boundaries require review, and adaptive confidence adjustments can only lower the submission tier.
 7. **Submission** — Confident detections are submitted to SponsorBlock as "intro" segments. Medium-confidence detections require manual review.
 
 ## Requirements
@@ -224,7 +224,7 @@ See [REPROCESSING.md](REPROCESSING.md) for the full design, the SponsorBlock own
 | `--peak-height` | 0.25 | Minimum raw correlation peak height |
 | `--weighted-threshold` | 0.60 | Minimum weighted score to accept a match |
 | `--search-limit` | 120.0 | Seconds of each video to scan |
-| `--early-exit` | 0.90 | Score above which to stop scanning early |
+| `--early-exit` | 0.90 | Compatibility option; full-window scanning and verification always run |
 
 ### Performance
 
@@ -344,19 +344,38 @@ Environment variables (`CHANNEL_URL`, `DATE_FROM`, `DATE_TO`) can also be set in
 
 ## Confidence Tiers
 
-| Tier | Raw Score | Behaviour |
+| Tier | Evidence Score | Behaviour |
 |------|-----------|-----------|
-| High | >= 0.80 | Auto-submit (unless `--manual-approval`) |
+| High | >= 0.80 | Auto-submit only after independent verification, with no review flags |
 | Medium | 0.45 - 0.80 | Always requires manual review |
-| Low | < 0.45 | Rejected automatically (no intro detected) |
+| Low | < 0.45 | Rejected during detection; later adaptive downgrades always require review |
+
+The evidence score is the minimum of raw chroma correlation, spectral coverage, and temporal similarity; it is not a calibrated probability. Unverified matches are rejected regardless of their raw score.
 
 ## Tips
 
 - **Start with `--manual-approval --dry-run`** to verify detection quality before submitting anything.
-- **After upgrading, clear `.fingerprint_cache/`** once (or just let stale entries regenerate automatically) — fingerprints now include a speech-band envelope used by the speech and talk-over detectors.
+- **Fingerprint caches regenerate automatically** after feature changes; no manual deletion is needed. Existing processing/audit records are preserved.
 - **Install `webrtcvad-wheels`** for the most reliable speech confirmation; without it the tool falls back to a built-in syllabic-modulation analysis (no extra dependencies). Note: no prebuilt wheels exist for Python 3.14 yet.
 - **Use `--clipboard`** during manual review to quickly open the video at the detected timestamp.
 - **Enable `--channel-id` from the start** so the learning system accumulates data even during initial manual runs.
 - **Multiple references help** when a channel has intro variations (different lengths, remixes, etc.).
-- **If detection quality is poor**, try adjusting `--peak-height` (lower = more sensitive) and `--weighted-threshold` (lower = more permissive).
+- **For intro variants**, supply the matching reference audio. Lowering candidate thresholds never bypasses independent verification. Increase `--search-limit` if the full intro falls outside the default 120s window.
 - **Rate limiting**: YouTube rate-limits aggressive downloading. Use `--workers 2-3` for a balance of speed and reliability. The system has built-in adaptive backoff and a circuit breaker (stops after 10 consecutive failures).
+
+## Detection regression tests
+
+```bash
+python -m unittest discover -v
+```
+
+The offline tests use `intro.m4a` and speech from `test.m4a`, generate temporary
+fixtures, and mock all submission services. They cover delayed intros, scan
+endpoints, gain/noise/AAC changes, no-intro audio, repeated music, tail speech,
+cache validity, parallel verification, and submission/review safeguards.
+
+See [DETECTION_RELIABILITY_2026-09.md](DETECTION_RELIABILITY_2026-09.md) for the
+history review, measured results, behavior changes, and limitations. Normal
+`--dry-run` detection no longer writes processing outcomes; old dry-run records
+also no longer block a real run. Existing submissions can be reviewed using
+`--reprocess --ignore-cache`; this upgrade does not automatically alter them.

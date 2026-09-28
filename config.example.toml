@@ -10,7 +10,7 @@
 peak_height = 0.25
 weighted_threshold = 0.60
 search_limit = 120.0
-early_exit = 0.90
+early_exit = 0.90  # compatibility only; full-window verification always runs
 
 # Behaviour
 manual_approval = false

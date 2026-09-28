@@ -1,3 +1,5 @@
+import re
+import threading
 import shutil
 import warnings
 import numpy as np
@@ -43,8 +45,8 @@ def get_audio_duration(audio_path: str) -> float:
     "PySoundFile failed. Trying audioread instead" and breaks on librosa 1.0).
 
     Strategy: soundfile for natively supported formats (wav/flac/ogg/mp3),
-    then ffprobe (ships with ffmpeg) for everything else. Returns 0.0 if
-    neither can read the file.
+    then ffprobe for everything else, with an ffmpeg header fallback for
+    imageio installations. Returns 0.0 if none can read the file.
     """
     try:
         import soundfile as sf
@@ -73,8 +75,24 @@ def get_audio_duration(audio_path: str) -> float:
         except Exception as e:
             logger.debug(f"ffprobe duration failed for {audio_path}: {e}")
 
+    ffmpeg = _get_ffmpeg_executable()
+    if ffmpeg:
+        try:
+            result = subprocess.run([ffmpeg, "-hide_banner", "-i", audio_path],
+                                    capture_output=True, text=True, timeout=30)
+            match = re.search(r"Duration: (\d+):(\d+):(\d+(?:\.\d+)?)", result.stderr)
+            if match:
+                hours, minutes, seconds = map(float, match.groups())
+                return hours * 3600 + minutes * 60 + seconds
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+
     logger.warning(f"Could not determine duration of {audio_path}")
     return 0.0
+
+
+class AudioAnalysisError(RuntimeError):
+    """Analysis failed; retry instead of permanently recording no intro."""
 
 
 class AudioFingerprinter:
@@ -82,6 +100,7 @@ class AudioFingerprinter:
 
     def __init__(self, sample_rate: int = 22050):
         self.sample_rate = sample_rate
+        self._scan_state = threading.local()
 
     # ------------------------------------------------------------------
     # Audio loading strategy:
@@ -92,35 +111,38 @@ class AudioFingerprinter:
     #      but will fail on video containers.
     # ------------------------------------------------------------------
     @staticmethod
-    def _convert_to_wav(audio_path: str) -> str:
+    def _convert_to_wav(audio_path: str, sample_rate: int = 22050,
+                        offset: float = 0.0, duration: float = None) -> str:
         """
         Convert any media file to a temporary 16-bit mono WAV via ffmpeg.
         Returns the path to the temp WAV (caller must clean up).
         Raises RuntimeError if ffmpeg fails.
         """
-        tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
-        tmp.close()
         ffmpeg_cmd = _get_ffmpeg_executable()
         if not ffmpeg_cmd:
             raise RuntimeError("ffmpeg not found")
+        tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+        tmp.close()
 
         cmd = [
             ffmpeg_cmd, "-y", "-v", "quiet",
             "-i", audio_path,
+            "-ss", str(offset),
+            *(["-t", str(duration)] if duration is not None else []),
             "-vn",                # strip video
             "-ac", "1",           # mono
-            "-ar", "22050",       # target sample rate
+            "-ar", str(sample_rate),       # target sample rate
             "-sample_fmt", "s16", # 16-bit
             tmp.name,
         ]
         try:
             subprocess.run(cmd, check=True, capture_output=True)
             return tmp.name
-        except subprocess.CalledProcessError as e:
+        except (subprocess.CalledProcessError, OSError) as e:
             os.unlink(tmp.name)
             raise RuntimeError(
                 f"ffmpeg failed to convert '{audio_path}' to WAV. "
-                f"stderr: {e.stderr.decode(errors='replace')[:500]}"
+                f"stderr: {str(getattr(e, 'stderr', b''))[:500]}"
             )
 
     def _load_audio(self, audio_path: str, offset: float = 0.0, duration: float = None):
@@ -131,11 +153,11 @@ class AudioFingerprinter:
         """
         # --- Strategy 1: ffmpeg pre-conversion (handles everything) ---
         if _has_ffmpeg():
-            tmp_path = self._convert_to_wav(audio_path)
+            tmp_path = self._convert_to_wav(audio_path, self.sample_rate, offset, duration)
             try:
                 y, sr = librosa.load(
                     tmp_path, sr=self.sample_rate,
-                    offset=offset, duration=duration, mono=True,
+                    mono=True,
                 )
                 return y, sr, tmp_path
             except Exception:
@@ -164,13 +186,14 @@ class AudioFingerprinter:
     # Fingerprint caching helpers
     # ------------------------------------------------------------------
     @classmethod
-    def _cache_key(cls, audio_path: str, duration, start_time: float) -> str:
+    def _cache_key(cls, audio_path: str, duration, start_time: float, sample_rate: int = 22050) -> str:
         """Deterministic cache key based on file content + params."""
         h = hashlib.sha256()
         with open(audio_path, "rb") as f:
             while chunk := f.read(1 << 16):
                 h.update(chunk)
-        h.update(f"{duration}:{start_time}".encode())
+        normalized_duration = None if duration is None else float(duration)
+        h.update(f"spectral-v2:{sample_rate}:{normalized_duration}:{float(start_time)}".encode())
         return h.hexdigest()
 
     @classmethod
@@ -179,8 +202,9 @@ class AudioFingerprinter:
         if not path.exists():
             return None
         try:
-            d = np.load(str(path), allow_pickle=True)
-            # KeyError on caches written before "speech_env" existed is
+            with np.load(str(path), allow_pickle=False) as archive:
+                d = {name: archive[name] for name in archive.files}
+            # KeyError on caches written before the current feature fields is
             # caught below -> treated as a cache miss -> regenerated.
             return {
                 "type": str(d["type"]),
@@ -189,6 +213,7 @@ class AudioFingerprinter:
                 "duration": float(d["duration"]),
                 "sr": int(d["sr"]),
                 "speech_env": d["speech_env"],
+                "spectral": d["spectral"],
             }
         except Exception:
             return None
@@ -197,15 +222,16 @@ class AudioFingerprinter:
     def _save_cache(cls, key: str, fp: dict):
         cls.CACHE_DIR.mkdir(exist_ok=True)
         path = cls.CACHE_DIR / f"{key}.npz"
-        np.savez_compressed(
-            str(path),
-            type=fp["type"],
-            data=fp["data"],
-            raw_chroma=fp["raw_chroma"],
-            duration=fp["duration"],
-            sr=fp["sr"],
-            speech_env=fp["speech_env"],
-        )
+        temp_path = None
+        try:
+            with tempfile.NamedTemporaryFile(dir=cls.CACHE_DIR, suffix=".npz", delete=False) as tmp:
+                temp_path = tmp.name
+                np.savez_compressed(tmp, **{name: fp[name] for name in (
+                    "type", "data", "raw_chroma", "duration", "sr", "speech_env", "spectral")})
+            os.replace(temp_path, path)
+        finally:
+            if temp_path and os.path.exists(temp_path):
+                os.unlink(temp_path)
 
     # ------------------------------------------------------------------
     # Core fingerprint generation
@@ -221,7 +247,7 @@ class AudioFingerprinter:
         cache_key = None
         if use_cache:
             try:
-                cache_key = self._cache_key(audio_path, duration, start_time)
+                cache_key = self._cache_key(audio_path, duration, start_time, self.sample_rate)
                 cached = self._load_cached(cache_key)
                 if cached:
                     logger.info("Loaded fingerprint from cache")
@@ -233,6 +259,8 @@ class AudioFingerprinter:
         try:
             y, sr, tmp_path = self._load_audio(audio_path, offset=start_time, duration=duration)
 
+            if len(y) < sr or not np.isfinite(y).all() or np.max(np.abs(y)) < 1e-6:
+                raise ValueError("Reference must contain at least one second of non-silent audio")
             chroma = librosa.feature.chroma_cqt(y=y, sr=sr)
 
             norm_factor = np.linalg.norm(chroma) + 1e-9
@@ -248,6 +276,7 @@ class AudioFingerprinter:
                 # itself. Speech-overlay detection compares the video's tail
                 # against this to find energy the intro doesn't account for.
                 "speech_env": self._speech_band_envelope(y, sr),
+                "spectral": self._spectral_features(y, sr),
             }
 
             # Save to cache
@@ -270,7 +299,7 @@ class AudioFingerprinter:
                     pass
 
     # ------------------------------------------------------------------
-    # Scan video for intro match (with early-exit optimisation)
+    # Scan the complete search window; all candidate peaks need verification
     # ------------------------------------------------------------------
     def scan_video(
         self,
@@ -279,15 +308,24 @@ class AudioFingerprinter:
         search_limit_seconds: float = 120.0,
         early_exit_threshold: float = 0.90,
     ):
-        if not needle_data:
-            return None, None, None
+        self._scan_state.context = None
+        if not needle_data or needle_data["sr"] != self.sample_rate:
+            raise AudioAnalysisError("Reference sample rate does not match the detector")
 
         tmp_path = None
         try:
             y_haystack, sr, tmp_path = self._load_audio(
                 haystack_path, duration=search_limit_seconds,
             )
+            if not np.isfinite(y_haystack).all():
+                raise ValueError("Audio contains non-finite samples")
+            if len(y_haystack) < sr or np.max(np.abs(y_haystack)) < 1e-8:
+                return None, None, None
             chroma_haystack = librosa.feature.chroma_cqt(y=y_haystack, sr=sr)
+            self._scan_state.context = (
+                self._audio_identity(haystack_path), chroma_haystack,
+                self._spectral_features(y_haystack, sr), len(y_haystack),
+            )
 
             needle = needle_data["data"]
             haystack = chroma_haystack
@@ -309,20 +347,17 @@ class AudioFingerprinter:
             for i in range(needle.shape[0]):
                 window_sum_sq += signal.correlate(haystack_sq[i], ones_kernel, mode="valid")
 
-            haystack_window_norms = np.sqrt(window_sum_sq)
+            haystack_window_norms = np.sqrt(np.maximum(window_sum_sq, 0.0))
             scores = numerator / (haystack_window_norms + 1e-5)
 
-            # --- Early exit: if we already have a very strong peak, skip further work ---
-            if np.max(scores) >= early_exit_threshold:
-                logger.debug(
-                    f"Early-exit: peak score {np.max(scores):.3f} >= {early_exit_threshold}"
-                )
+            # early_exit_threshold remains accepted for config compatibility.
+            # A high chroma peak cannot justify skipping independent verification.
 
             return scores, sr, hop_length
 
         except Exception as e:
             logger.error(f"Scan error: {e}")
-            return None, None, None
+            raise AudioAnalysisError(f"Cannot scan {haystack_path}") from e
         finally:
             if tmp_path and os.path.exists(tmp_path):
                 try:
@@ -333,65 +368,97 @@ class AudioFingerprinter:
     # ------------------------------------------------------------------
     # Match verification
     # ------------------------------------------------------------------
+    @staticmethod
+    def _audio_identity(path):
+        stat = os.stat(path)
+        return os.path.abspath(path), stat.st_size, stat.st_mtime_ns
+
+    @staticmethod
+    def _spectral_features(y, sr):
+        """Log mel spectrum retains timbre and frequency detail lost by chroma."""
+        power = librosa.feature.melspectrogram(
+            y=y, sr=sr, n_fft=2048, hop_length=512, n_mels=64,
+            fmin=80, fmax=min(10000, sr / 2),
+        )
+        db = librosa.power_to_db(power, ref=1.0, amin=1e-12, top_db=None)
+        # Clip relative to each frame, so a loud lead-in cannot erase the
+        # fingerprint of a quiet intro elsewhere in the search window.
+        return np.maximum(db, np.max(db, axis=0, keepdims=True) - 60)
+
     def verify_match_quality(
-        self,
-        needle_data: dict,
-        video_path: str,
-        start_time: float,
+        self, needle_data: dict, video_path: str, start_time: float,
         sim_threshold: float = 0.70,
     ) -> dict | None:
-        """
-        Measure how well the reference actually matches the video at a
-        candidate start position, frame by frame.
+        """Require sustained spectral AND temporal agreement, independent of chroma.
 
-        Cross-correlation peaks can be inflated by harmonically similar
-        music, especially at position 0. A true intro match keeps high
-        cosine similarity for the FULL reference duration; a false peak
-        collapses after a few seconds. Coverage captures that difference.
-
-        Returns:
-            {"mean_similarity": float, "coverage": float, "frames": int}
-            or None if the audio could not be analysed.
+        Scan features are reused per thread so checking every plausible peak
+        does not decode the video repeatedly. Missing/truncated evidence fails
+        closed. The temporal score rejects stationary tones and similar chords.
         """
-        wav_path = None
+        tmp = None
         try:
-            duration = needle_data["duration"]
-            ref_chroma = needle_data["raw_chroma"]
             sr = needle_data["sr"]
-
-            y_vid, _, wav_path = self._load_audio(
-                video_path, offset=start_time, duration=duration,
-            )
-            if len(y_vid) < sr * 1.0:
+            if sr != self.sample_rate or not np.isfinite(start_time) or start_time < 0:
                 return None
-
-            vid_chroma = librosa.feature.chroma_cqt(y=y_vid, sr=sr)
-
-            min_cols = min(ref_chroma.shape[1], vid_chroma.shape[1])
-            if min_cols < 20:
+            ref_spec = needle_data["spectral"]
+            ref_chroma = needle_data["raw_chroma"]
+            context = getattr(self._scan_state, "context", None)
+            if context is not None and context[0] == self._audio_identity(video_path):
+                _, chroma, spectrum, samples = context
+                frame = int(round(start_time * sr / 512))
+                vid_chroma = chroma[:, frame:frame + ref_chroma.shape[1]]
+                vid_spec = spectrum[:, frame:frame + ref_spec.shape[1]]
+                available = samples / sr - start_time
+            else:
+                y, _, tmp = self._load_audio(video_path, offset=start_time,
+                                              duration=needle_data["duration"])
+                available = len(y) / sr
+                if available + 512 / sr < needle_data["duration"]:
+                    return None
+                vid_chroma = librosa.feature.chroma_cqt(y=y, sr=sr)
+                vid_spec = self._spectral_features(y, sr)
+            if available + 512 / sr < needle_data["duration"]:
                 return None
-
-            ref = ref_chroma[:, :min_cols]
-            vid = vid_chroma[:, :min_cols]
-            ref = ref / (np.linalg.norm(ref, axis=0) + 1e-9)
-            vid = vid / (np.linalg.norm(vid, axis=0) + 1e-9)
-            similarity = np.sum(ref * vid, axis=0)
-
+            n = min(ref_spec.shape[1], vid_spec.shape[1],
+                    ref_chroma.shape[1], vid_chroma.shape[1])
+            edge = max(1, int(0.15 * sr / 512))
+            if n < 2 * edge + 20:
+                return None
+            sl = slice(edge, n - edge)
+            ref, vid = ref_chroma[:, sl], vid_chroma[:, sl]
+            similarity = np.sum(ref * vid, axis=0) / (
+                np.linalg.norm(ref, axis=0) * np.linalg.norm(vid, axis=0) + 1e-9)
+            ref, vid = ref_spec[:, sl].copy(), vid_spec[:, sl].copy()
+            # Subtract broadband gain independently for each frame.
+            ref -= np.mean(ref, axis=0)
+            vid -= np.mean(vid, axis=0)
+            spectral_sim = np.sum(ref * vid, axis=0) / (
+                np.linalg.norm(ref, axis=0) * np.linalg.norm(vid, axis=0) + 1e-9)
+            # Compare changes over time, removing persistent spectral colour.
+            ref -= np.mean(ref, axis=1, keepdims=True)
+            vid -= np.mean(vid, axis=1, keepdims=True)
+            temporal = float(np.sum(ref * vid) / (
+                np.linalg.norm(ref) * np.linalg.norm(vid) + 1e-9))
+            coverage = float(np.mean(spectral_sim >= 0.80))
+            # A short matching burst must not validate an unrelated remainder.
+            blocks = np.array_split(spectral_sim, max(1, int(needle_data["duration"] / 2)))
+            weakest = min(float(np.mean(block >= 0.75)) for block in blocks)
+            verified = (coverage >= 0.80 and temporal >= 0.55 and weakest >= 0.50)
             return {
                 "mean_similarity": float(np.mean(similarity)),
                 "coverage": float(np.mean(similarity >= sim_threshold)),
-                "frames": int(min_cols),
+                "frames": n,
+                "spectral_coverage": coverage,
+                "temporal_similarity": temporal,
+                "verified": bool(verified),
+                "quality": min(coverage, max(0.0, temporal)),
             }
-
         except Exception as e:
             logger.error(f"Match verification failed at {start_time:.2f}s: {e}")
-            return None
+            raise AudioAnalysisError(f"Cannot verify {video_path}") from e
         finally:
-            if wav_path and os.path.exists(wav_path):
-                try:
-                    os.unlink(wav_path)
-                except OSError:
-                    pass
+            if tmp and os.path.exists(tmp):
+                os.unlink(tmp)
 
     # ------------------------------------------------------------------
     # Adaptive divergence detection (unchanged logic, robust loading)
@@ -851,7 +918,7 @@ class AudioFingerprinter:
                         vad_says_speech = self._modulation_confirms_speech(
                             confirm_seg, sr,
                         )
-                    if vad_says_speech is False:
+                    if vad_says_speech is not True:
                         logger.info(
                             f"Energy spike at {absolute_time:.2f}s "
                             f"(excess={ratio_vs_baseline:.2f}x) NOT confirmed as "
@@ -882,4 +949,4 @@ class AudioFingerprinter:
                         pass
 
     def cleanup(self):
-        pass
+        self._scan_state.context = None
